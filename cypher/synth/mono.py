@@ -147,28 +147,22 @@ class MonoSynthVoice(Voice):
         return FILTER_MODE_NAMES[self._filter_mode]
 
     def trigger(self, note: int, velocity: float) -> None:
-        # If the voice is still sounding (envelope above a small threshold),
-        # this is a retrigger. Keep oscillator phase + filter state to avoid clicks.
-        is_retriggering = self._active and self._amp_env._level > 0.001
-
+        is_legato = self._active and self._current_note >= 0
         self._current_note = note
         self._velocity = velocity
         self._target_freq = note_to_freq(note)
 
-        if is_retriggering and self._glide_ms > 1.5:
+        if is_legato and self._glide_ms > 1.5:
             self._glide_active = True
         else:
             self._current_freq = self._target_freq
             self._glide_active = False
-            # Only hard-reset oscillator and filter state when fully idle.
-            # Retriggering mid-release keeps phase continuous (no click).
-            if not is_retriggering:
-                self._phase_a = 0.0
-                self._phase_b = 0.0
-                self._filter.reset()
-                self._lfo.reset()
+            self._phase_a = 0.0
+            self._phase_b = 0.0
             self._amp_env.trigger()
             self._filter_env.trigger()
+            self._filter.reset()
+            self._lfo.reset()
 
         self._active = True
 
@@ -220,43 +214,24 @@ class MonoSynthVoice(Voice):
             noise = self._noise_gen.process(num_frames)
             signal = signal * (1.0 - self._noise_level) + noise * self._noise_level
 
-        # --- Filter envelope modulation (per-sample array) ---
+        # --- Filter envelope modulation ---
         filt_env = self._filter_env.process(num_frames)
         env_mod_octaves = self._fenv_amount * filt_env * 7.0
-
-        lfo_to_filter = self._lfo_dest == 0 and self._lfo_depth > 0.001
-        q = 0.707 / max(1.0 - self._resonance, 0.05)
-        max_cutoff = self.sample_rate * 0.45
-
-        # Filter env changes at envelope rates — block-scalar is fine.
         avg_env_mod = float(np.mean(env_mod_octaves))
 
-        if not lfo_to_filter:
-            # No LFO modulation on the filter: one cutoff per block, like before.
-            effective_cutoff = self._cutoff_hz * (2.0 ** avg_env_mod)
-            effective_cutoff = max(20.0, min(effective_cutoff, max_cutoff))
-            self._filter.set_mode(self._filter_mode, effective_cutoff, q)
-            signal = self._filter.process(signal)
-        else:
-            # Sub-block processing for smooth LFO→filter modulation. Block-
-            # scalar cutoff gave audible zipper/stutter on any LFO rate above
-            # block rate (~47Hz at 1024 samples/48kHz). 128-sample sub-blocks
-            # give ~2.7ms granularity, fine for LFOs up to 20Hz. Only re-tune
-            # coefficients when the cutoff has moved >1% to keep biquad
-            # coefficient changes rare enough to avoid switching artifacts.
-            SUB_BLOCK = 128
-            filtered = np.empty(num_frames, dtype=np.float32)
-            last_cutoff = -1.0
-            for start in range(0, num_frames, SUB_BLOCK):
-                end = min(start + SUB_BLOCK, num_frames)
-                sub_lfo_mod = float(np.mean(lfo_out[start:end])) * 3.0
-                sub_cutoff = self._cutoff_hz * (2.0 ** (avg_env_mod + sub_lfo_mod))
-                sub_cutoff = max(20.0, min(sub_cutoff, max_cutoff))
-                if last_cutoff < 0 or abs(sub_cutoff - last_cutoff) / last_cutoff > 0.01:
-                    self._filter.set_mode(self._filter_mode, sub_cutoff, q)
-                    last_cutoff = sub_cutoff
-                filtered[start:end] = self._filter.process(signal[start:end])
-            signal = filtered
+        # --- LFO → filter modulation ---
+        lfo_filter_mod = 0.0
+        if self._lfo_dest == 0 and self._lfo_depth > 0.001:
+            # LFO → filter: up to +/- 3 octaves at full depth
+            lfo_filter_mod = float(np.mean(lfo_out)) * 3.0
+
+        effective_cutoff = self._cutoff_hz * (2.0 ** (avg_env_mod + lfo_filter_mod))
+        effective_cutoff = max(20.0, min(effective_cutoff, self.sample_rate * 0.45))
+
+        # Q from resonance
+        q = 0.707 / max(1.0 - self._resonance, 0.05)
+        self._filter.set_mode(self._filter_mode, effective_cutoff, q)
+        signal = self._filter.process(signal)
 
         # --- VCA: amplitude envelope ---
         amp_env = self._amp_env.process(num_frames)

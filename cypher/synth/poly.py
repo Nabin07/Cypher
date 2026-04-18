@@ -42,8 +42,6 @@ class PolySynthVoice(Voice):
         self._note_map: dict[int, MonoSynthVoice] = {}
         # Allocation order — oldest first, for voice stealing
         self._alloc_order: list[MonoSynthVoice] = []
-        # Smoothed voice-count scaling to prevent pops when voices come/go
-        self._smoothed_scale: float = 1.0
 
     # ------------------------------------------------------------------
     # Voice interface
@@ -106,13 +104,9 @@ class PolySynthVoice(Voice):
                 buf += v.process(num_frames)
                 active += 1
 
-        # Ramp the voice-count scaling across the block to avoid pops when
-        # voices enter/exit. Previously jumped instantly between blocks.
-        target_scale = 1.0 / np.sqrt(max(1, active))
-        start_scale = self._smoothed_scale
-        ramp = np.linspace(start_scale, target_scale, num_frames, dtype=np.float32)
-        buf *= ramp
-        self._smoothed_scale = target_scale
+        # Scale down to prevent clipping — sqrt gives natural loudness curve
+        if active > 1:
+            buf /= np.sqrt(active)
 
         return buf
 
@@ -161,14 +155,15 @@ class PolySynthVoice(Voice):
             if not v.is_active:
                 return v
 
-        # All busy — steal oldest. Don't hard-kill the voice; trigger() will
-        # transition smoothly from current envelope level into the new attack.
+        # All busy — steal oldest
         if self._alloc_order:
             stolen = self._alloc_order.pop(0)
+            # Clean up note map
             for note, voice in list(self._note_map.items()):
                 if voice is stolen:
                     del self._note_map[note]
                     break
+            stolen.all_notes_off()
             return stolen
 
         # Fallback (shouldn't happen)

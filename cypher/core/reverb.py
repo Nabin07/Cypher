@@ -177,6 +177,15 @@ class DattorroPlateReverb:
     to the actual sample rate, preserving the room character.
     """
 
+    # Mode presets: (size_mult, mod_depth, mod_rate)
+    MODES = {
+        0: ("ROOM",    0.30, 0.3, 0.5),
+        1: ("CHAMBER", 0.50, 0.4, 0.7),
+        2: ("HALL",    1.00, 0.6, 0.9),
+        3: ("PLATE",   0.75, 0.8, 1.2),
+    }
+    MODE_NAMES = ["ROOM", "CHAMBER", "HALL", "PLATE"]
+
     def __init__(self, sample_rate: int = DEFAULT_SAMPLE_RATE) -> None:
         self.sample_rate = sample_rate
 
@@ -187,6 +196,12 @@ class DattorroPlateReverb:
         self.predelay_ms: float = 20.0  # ms before reverb onset
         self.mod_depth: float = 0.5    # LFO excursion in samples
         self.mod_rate: float = 0.8     # LFO rate in Hz
+        self.low_cut_hz: float = 80.0  # HPF on wet output (20-500Hz)
+        self.mode: int = 2             # default HALL
+
+        # Low-cut HPF state
+        self._hpf_prev_in: float = 0.0
+        self._hpf_prev_out: float = 0.0
 
         # ── Pre-delay ──
         max_predelay = int(0.15 * sample_rate)  # 150ms max
@@ -252,7 +267,7 @@ class DattorroPlateReverb:
         output = np.zeros(n, dtype=np.float32)
 
         predelay_samps = max(1, int(self.predelay_ms / 1000.0 * self.sample_rate))
-        decay = min(0.99, max(0.0, self.decay))
+        decay = min(0.999, max(0.0, self.decay))
         damping = min(0.99, max(0.0, self.damping))
         damp_inv = 1.0 - damping
         mod_depth = self.mod_depth * 12.0
@@ -303,9 +318,23 @@ class DattorroPlateReverb:
         lfo_phase = self._lfo_phase
         TWO_PI = 2.0 * math.pi
 
-        # Output tap positions (local lists)
-        tl = self._taps_l
-        tr = self._taps_r
+        # Low-cut HPF coefficient
+        lc_freq = max(20.0, min(500.0, self.low_cut_hz))
+        hpf_rc = 1.0 / (TWO_PI * lc_freq)
+        hpf_dt = 1.0 / self.sample_rate
+        hpf_alpha = hpf_rc / (hpf_rc + hpf_dt)
+        hpf_prev_in = self._hpf_prev_in
+        hpf_prev_out = self._hpf_prev_out
+
+        # Mode-based size scaling for tank reads
+        _, size_mult, _, _ = self.MODES.get(self.mode, self.MODES[2])
+        # Scale tank delay lengths by size
+        td_lens_s = [max(1, int(l * size_mult)) for l in td_lens]
+        td2_lens_s = [max(1, int(l * size_mult)) for l in td2_lens]
+
+        # Output tap positions (scaled by size)
+        tl = [max(1, int(t * size_mult)) for t in self._taps_l]
+        tr = [max(1, int(t * size_mult)) for t in self._taps_r]
 
         # --- Main loop: everything inlined ---
         for i in range(n):
@@ -361,7 +390,7 @@ class DattorroPlateReverb:
             # Tank delay 0: write + read
             td_bufs[0][td_wps[0] & td_masks[0]] = ap_out
             td_wps[0] += 1
-            d0 = float(td_bufs[0][(td_wps[0] - td_lens[0]) & td_masks[0]])
+            d0 = float(td_bufs[0][(td_wps[0] - td_lens_s[0]) & td_masks[0]])
 
             # Damping 0
             damp0 = damp_inv * d0 + damping * damp0
@@ -370,7 +399,7 @@ class DattorroPlateReverb:
             # Tank delay2 0: write + read
             td2_bufs[0][td2_wps[0] & td2_masks[0]] = d0
             td2_wps[0] += 1
-            ts0 = float(td2_bufs[0][(td2_wps[0] - td2_lens[0]) & td2_masks[0]])
+            ts0 = float(td2_bufs[0][(td2_wps[0] - td2_lens_s[0]) & td2_masks[0]])
 
             # --- Tank loop 1 ---
             tank_in = x + decay * ts0
@@ -396,7 +425,7 @@ class DattorroPlateReverb:
             # Tank delay 1: write + read
             td_bufs[1][td_wps[1] & td_masks[1]] = ap_out
             td_wps[1] += 1
-            d1 = float(td_bufs[1][(td_wps[1] - td_lens[1]) & td_masks[1]])
+            d1 = float(td_bufs[1][(td_wps[1] - td_lens_s[1]) & td_masks[1]])
 
             # Damping 1
             damp1 = damp_inv * d1 + damping * damp1
@@ -405,7 +434,7 @@ class DattorroPlateReverb:
             # Tank delay2 1: write + read
             td2_bufs[1][td2_wps[1] & td2_masks[1]] = d1
             td2_wps[1] += 1
-            ts1 = float(td2_bufs[1][(td2_wps[1] - td2_lens[1]) & td2_masks[1]])
+            ts1 = float(td2_bufs[1][(td2_wps[1] - td2_lens_s[1]) & td2_masks[1]])
 
             # --- Output taps (inlined reads) ---
             w_td0 = td_wps[0]
@@ -436,7 +465,13 @@ class DattorroPlateReverb:
                 - float(td2_bufs[0][(w_td20 - tr[6]) & m_td20])
             )
 
-            output[i] = dry_sample * dry_gain + (wet_l + wet_r) * 0.25 * wet_gain
+            # Low-cut HPF on wet signal
+            wet_sample = (wet_l + wet_r) * 0.25
+            hpf_out = hpf_alpha * (hpf_prev_out + wet_sample - hpf_prev_in)
+            hpf_prev_in = wet_sample
+            hpf_prev_out = hpf_out
+
+            output[i] = dry_sample * dry_gain + hpf_out * wet_gain
 
         # --- Write back all mutated state ---
         self._predelay._write_pos = pd_wp
@@ -451,6 +486,8 @@ class DattorroPlateReverb:
         self._tank_state[0] = ts0
         self._tank_state[1] = ts1
         self._lfo_phase = lfo_phase
+        self._hpf_prev_in = hpf_prev_in
+        self._hpf_prev_out = hpf_prev_out
 
         return output
 
@@ -469,6 +506,16 @@ class DattorroPlateReverb:
             d.clear()
         self._tank_state = [0.0, 0.0]
         self._lfo_phase = 0.0
+        self._hpf_prev_in = 0.0
+        self._hpf_prev_out = 0.0
+
+    def set_mode(self, mode_idx: int) -> None:
+        """Apply a mode preset — adjusts size and mod characteristics."""
+        mode_idx = max(0, min(3, mode_idx))
+        self.mode = mode_idx
+        _, _, md, mr = self.MODES[mode_idx]
+        self.mod_depth = md
+        self.mod_rate = mr
 
     def get_state(self) -> dict:
         return {
@@ -478,4 +525,7 @@ class DattorroPlateReverb:
             "predelay_ms": self.predelay_ms,
             "mod_depth": self.mod_depth,
             "mod_rate": self.mod_rate,
+            "low_cut_hz": self.low_cut_hz,
+            "mode": self.mode,
+            "mode_name": self.MODE_NAMES[self.mode],
         }
