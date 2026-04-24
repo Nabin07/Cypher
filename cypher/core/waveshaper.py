@@ -35,25 +35,35 @@ def tape_saturate(signal: AudioBuffer, drive: float) -> AudioBuffer:
 
     This is the sound of the Zay 808 — warm, fat, musical distortion
     that makes the 808 feel bigger without getting harsh.
-    """
-    # Asymmetric soft clip — positive peaks saturate differently than negative
-    # This produces even harmonics (2nd, 4th, 6th) which sound warm
-    driven = signal * drive
-    pos = np.tanh(driven * 0.9)
-    neg = np.tanh(driven * 1.1)
-    asym = np.where(driven >= 0, pos, neg)
 
-    # Soft knee compression — tames peaks gently
-    # Mix between clean and saturated based on level
-    level = np.abs(driven)
-    mix = np.tanh(level * 2.0)  # Higher levels get more saturation
+    Asymmetric curve is C^∞-smooth (no derivative kinks at zero crossings)
+    so it doesn't generate audible crackle on sustained low-frequency tones.
+    """
+    driven = signal * drive
+
+    # Smooth asymmetric waveshaper.
+    #
+    # Inner argument: driven - bias * driven * tanh(driven)
+    #   - Near zero: `driven * tanh(driven)` ≈ driven² (always ≥ 0, smooth).
+    #   - At large driven: `driven * tanh(driven)` ≈ |driven|_smooth, bounded.
+    # The subtraction makes negative peaks saturate harder than positive peaks,
+    # which is the classic magnetic-tape fingerprint. No np.where, no branches,
+    # derivative is continuous everywhere → no buzzing on low-freq tones.
+    bias = 0.12
+    inner = driven - bias * driven * np.tanh(driven)
+    asym = np.tanh(inner)
+
+    # Soft-knee compression: crossfade dry ↔ saturated by level.
+    # sqrt(x² + ε) is a smooth |x| — avoids the abs() kink at zero.
+    level = np.sqrt(driven * driven + 1e-8)
+    mix = np.tanh(level * 2.0)
     result = signal * (1.0 - mix) + asym * mix
 
-    # Slight bass warmth — tape proximity effect
-    # Simple one-pole lowpass mixed in at low level
+    # Slight bass warmth — tape proximity effect (one-pole LP on the wet).
+    # Same shape as before, just vectorised is fine for Python here.
     warmth = np.zeros_like(result)
     prev = 0.0
-    alpha = 0.995  # Very low cutoff
+    alpha = 0.995
     for i in range(len(result)):
         prev = alpha * prev + (1.0 - alpha) * result[i]
         warmth[i] = prev

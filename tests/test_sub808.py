@@ -128,7 +128,7 @@ class TestSub808:
         assert "current_pitch_hz" in state
         assert "pitch_mod_level" in state
         assert "amp_env_stage" in state
-        assert "tone_amount" in state
+        assert "body_ms" in state
         assert "noise_active" in state
         assert "sat_character" in state
 
@@ -139,7 +139,7 @@ class TestSub808:
         # Page 1 — Simple
         assert voice.params[0].label == "DECAY"
         assert voice.params[1].label == "PUNCH"
-        assert voice.params[2].label == "TONE"
+        assert voice.params[2].label == "BODY"
         assert voice.params[3].label == "DRIVE"
         # Page 2 — Advanced
         assert voice.params[4].label == "SHAPE"
@@ -185,12 +185,16 @@ class TestSub808:
 
         toned = Sub808Voice(sample_rate)
         toned.params[1].value = 0.0
-        toned.params[2].value = 0.8  # TONE: high
-        toned.params[3].value = 0.0
+        # BODY replaces TONE. Longer BODY + some DRIVE = harmonic body that
+        # lingers longer before the sine takes over solo.
+        toned.params[2].value = 0.9  # BODY: long (~1500ms)
+        toned.params[3].value = 0.5  # DRIVE: some saturation to generate harmonics
+        toned.params[10].value = 0.5  # SAT: TAPE
         toned.trigger(36, 0.9)
         out_toned = toned.process(int(0.5 * sample_rate))
 
-        # TONE adds 2nd + 3rd harmonics. Compare harmonic-to-fundamental ratio.
+        # With long BODY + DRIVE, harmonics above the fundamental should
+        # exist throughout the buffer (body env hasn't fully decayed).
         fft_clean = np.abs(np.fft.rfft(out_clean))
         fft_toned = np.abs(np.fft.rfft(out_toned))
         freqs = np.fft.rfftfreq(len(out_clean), 1.0 / sample_rate)

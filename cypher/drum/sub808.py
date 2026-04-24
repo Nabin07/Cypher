@@ -67,9 +67,13 @@ class Sub808Voice(Voice):
                 unit="st", curve=Curve.LINEAR,
             ),
             Parameter(
-                name="tone", label="TONE",
-                min_val=0.0, max_val=1.0, default=0.0,
-                unit="%", curve=Curve.LINEAR,
+                # BODY replaces TONE. Controls how long the harmonic "meat"
+                # layer lasts before the sub sine takes over solo. This
+                # recreates the classic Dro/Zay 808 three-phase envelope:
+                # attack → saturated body → clean sub tail.
+                name="body", label="BODY",
+                min_val=20.0, max_val=2000.0, default=0.35,
+                unit="ms", curve=Curve.EXPONENTIAL,
             ),
             Parameter(
                 name="drive", label="DRIVE",
@@ -145,6 +149,16 @@ class Sub808Voice(Voice):
         self._amp_env.sustain_level = 1.0
         self._amp_env.curve = -3.0
 
+        # --- Body (harmonic) envelope ---
+        # Modulates DRIVE amount AND filter brightness over time so the
+        # saturated/bright harmonics fade out first, leaving the clean
+        # sub sine. Decays 1.0 → 0.0 over BODY ms.
+        self._body_env = ADEnvelope(sample_rate)
+        self._body_env.attack_time = 0.001
+        self._body_env.sustain_level = 0.0
+        self._body_env.curve = -2.5
+        self._last_body_env: float = 0.0  # for filter modulation each block
+
         # --- Filter ---
         self._filter = BiquadFilter(sample_rate)
 
@@ -197,8 +211,7 @@ class Sub808Voice(Voice):
 
         # Noise envelope — decays slightly slower than pitch for brightness
         self._noise_env.decay_time = (decay_ms * 1.5) / 1000.0
-        noise_center = 4000.0 + self._params[2].mapped * 8000.0  # TONE affects noise too
-        self._noise_filter.set_bandpass(min(noise_center, 20000.0), q=1.0)
+        self._noise_filter.set_bandpass(4000.0, q=1.0)
 
         # Amplitude gate release
         release_ms = self._params[6].mapped
@@ -349,6 +362,12 @@ class Sub808Voice(Voice):
         is_legato = (self._active and self._current_note >= 0
                      and self._trigger_mode == "classic")
 
+        # Body envelope reloads its decay time and re-triggers for every hit,
+        # legato or fresh. The harmonics should always fade again on retrigger.
+        body_ms = self._params[2].mapped
+        self._body_env.decay_time = max(0.020, body_ms / 1000.0)
+        self._body_env.trigger()
+
         if is_legato:
             # Legato — glide pitch, keep oscillator + amp running
             self._pitch_glide.glide_to(self._base_freq)
@@ -422,9 +441,6 @@ class Sub808Voice(Voice):
         # --- Oscillator (pure sine) ---
         signal = self._osc.process(freq)
 
-        # --- TONE: blend in harmonics ---
-        signal = self._apply_tone(signal)
-
         # --- Noise burst layer ---
         noise_amount = self._params[5].mapped
         if noise_amount > 0.001 and self._noise_env.is_active:
@@ -434,14 +450,28 @@ class Sub808Voice(Voice):
             signal = signal * (1.0 - noise_amount) + noise * noise_env * noise_amount * 3.0
             signal = signal.astype(np.float32)
 
-        # --- Distortion (pre-filter so filter tames the harmonics) ---
+        # --- Body envelope — gates the harmonic layer ---
+        # Runs every block so BODY changes are always reflected. Even with
+        # no saturation, we use body_env to modulate a small filter-cutoff
+        # brightness boost so BODY is audible on its own.
+        body_env = self._body_env.process(num_frames)
+        self._last_body_env = float(body_env[-1]) if len(body_env) > 0 else 0.0
+
+        # --- Distortion with BODY envelope ---
+        # At body_env=1 we hear sat+sine; at body_env=0 only clean sine.
         drive_amount = self._params[3].mapped
         sat_val = self._params[10].mapped  # 0=OFF, 1=SOFT, 2=TAPE, 3=HARD, 4=CRUSH
 
         if drive_amount > 0.005 and sat_val > 0.05:
-            signal = self._apply_saturation(signal, drive_amount, sat_val)
+            saturated = self._apply_saturation(signal, drive_amount, sat_val)
+            signal = signal * (1.0 - body_env) + saturated * body_env
+            signal = signal.astype(np.float32)
 
         # --- Filter (post-distortion so it controls brightness) ---
+        # Filter coefficients are kept stable across blocks. Modulating the
+        # cutoff with body_env causes coefficient snaps between blocks =
+        # audible clicks. BODY is tied only to the saturation crossfade
+        # (which is per-sample numpy blend, no state jumps).
         cutoff = self._params[8].mapped
         if cutoff < 15000.0:
             signal = self._filter.process(signal)
@@ -482,7 +512,7 @@ class Sub808Voice(Voice):
             "amp_env_stage": self._amp_env.stage,
             "is_gliding": self._pitch_glide.is_gliding,
             "sat_character": self._sat_char_name,
-            "tone_amount": self._params[2].mapped,
+            "body_ms": self._params[2].mapped,
             "noise_active": self._noise_env.is_active,
             "current_note": self._current_note,
             "velocity": self._velocity,

@@ -353,8 +353,6 @@ class Player:
         self._strum_stop = threading.Event()
 
         def _humanize():
-            with self.lock:
-                self.synth.release_all()
             self.active_midi_notes.clear()
             for i, note in enumerate(notes):
                 if self._strum_stop.is_set():
@@ -380,8 +378,6 @@ class Player:
         delay_per_note = (60.0 / self.chord_bpm) * div / max(1, len(ordered) - 1) if len(ordered) > 1 else 0
 
         def _strum():
-            with self.lock:
-                self.synth.release_all()
             self.active_midi_notes.clear()
             for i, note in enumerate(ordered):
                 if self._strum_stop.is_set():
@@ -414,25 +410,20 @@ class Player:
             last_note = -1
             while not self._arp_stop.is_set():
                 note = self._arp_notes[idx % len(self._arp_notes)]
-                if last_note >= 0:
-                    with self.lock:
-                        self.synth.release(last_note)
-                    self.active_midi_notes.discard(last_note)
+                # Don't hard-release previous note — just trigger the new one.
+                # The poly pool handles voice reuse (same note = same voice,
+                # soft retrigger via envelope). No gap = no pop.
                 with self.lock:
                     self.synth.trigger(note, velocity)
+                if last_note >= 0 and last_note != note:
+                    self.active_midi_notes.discard(last_note)
                 self.active_midi_notes.add(note)
                 last_note = note
-                # Apply swing
                 actual_dur = note_duration
                 if idx % 2 == 1 and self.chord_swing > 0:
                     actual_dur *= (1.0 + self.chord_swing * 0.5)
                 self._arp_stop.wait(actual_dur)
                 idx += 1
-            # Release last note
-            if last_note >= 0:
-                with self.lock:
-                    self.synth.release(last_note)
-                self.active_midi_notes.discard(last_note)
             self._arp_running = False
 
         self._arp_thread = threading.Thread(target=_arp, daemon=True)
