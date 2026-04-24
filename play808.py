@@ -46,6 +46,14 @@ from cypher.synth.chords import (
 from cypher.core.types import DEFAULT_SAMPLE_RATE
 from cypher.core.reverb import DattorroPlateReverb
 from cypher.core.parameter import Parameter, Curve
+from cypher.core.project import Project
+from cypher.sampler.sampler import (
+    SamplerEngine, PAD_MIDI_START, PAD_MIDI_END,
+)
+from cypher.sampler.loader import (
+    pick_folder_dialog, scan_folder, load_sample, load_sample_with_meta,
+)
+from cypher.sampler.sidecar import write_sidecar
 from cypher.midi import NoteOn, NoteOff, ControlChange, MidiMessage
 from cypher import midi_input
 
@@ -72,7 +80,8 @@ KEY_GREY = (40, 40, 50)
 KEY_DOT = (255, 100, 255)
 
 # --- Window ---
-WIN_W, WIN_H = 800, 780
+WIN_W, WIN_H = 800, 830
+METRO_STRIP_H = 50
 WAVE_H = 100          # waveform display height
 WAVE_W = 230          # waveform display width
 PREVIEW_SAMPLES = 4096
@@ -124,11 +133,29 @@ VOICE_PAGES = {
         {"name": "AMP", "params": [8, 9, 10, 11]},
         {"name": "MOD", "params": [12, 13, 14, 15]},
     ],
-    "FX": [],     # FX uses custom slot-based UI
-    "CHORD": [],  # CHORD uses custom UI
+    "FX": [],        # FX uses custom slot-based UI
+    "CHORD": [],     # CHORD uses custom UI
+    "SAMPLER": [],   # SAMPLER uses custom UI
 }
 
-VOICE_NAMES = ["808", "KICK", "SYNTH", "FX", "CHORD"]
+VOICE_NAMES = ["808", "KICK", "SYNTH", "FX", "CHORD", "SAMPLER"]
+SAMPLER_IDX = 5
+
+# Tab index → voice-list index (None for FX/CHORD which aren't sound voices)
+TAB_TO_VOICE = {0: 0, 1: 1, 2: 2, 3: None, 4: None, 5: 3}
+
+
+def tab_voice_idx(tab_idx):
+    return TAB_TO_VOICE.get(tab_idx)
+
+
+# MPC-style 4x4 pad keyboard layout for the SAMPLER tab
+SAMPLER_PAD_KEYS = {
+    pygame.K_z: 0,  pygame.K_x: 1,  pygame.K_c: 2,  pygame.K_v: 3,
+    pygame.K_a: 4,  pygame.K_s: 5,  pygame.K_d: 6,  pygame.K_f: 7,
+    pygame.K_q: 8,  pygame.K_w: 9,  pygame.K_e: 10, pygame.K_r: 11,
+    pygame.K_1: 12, pygame.K_2: 13, pygame.K_3: 14, pygame.K_4: 15,
+}
 
 # FX reverb parameters
 FX_REVERB_PARAMS = [
@@ -167,10 +194,15 @@ RHYTHM_NAMES = list(RHYTHM_DIVS.keys())
 
 class Player:
     def __init__(self):
+        self.project = Project(key=0, scale_idx=1, bpm=120.0)
+
         self.sub808 = Sub808Voice(SR)
         self.kick = KickVoice(SR)
         self.synth = PolySynthVoice(SR)
-        self.voices = [self.sub808, self.kick, self.synth]
+        self.sampler = SamplerEngine(SR, project=self.project)
+        from cypher.core.metronome import Metronome
+        self.metronome = Metronome(self.project, SR)
+        self.voices = [self.sub808, self.kick, self.synth, self.sampler]
         self.voice_idx = 0
         self.lock = threading.Lock()
         self.octave = 2
@@ -197,8 +229,9 @@ class Player:
             'max_val': p.max_val, 'default': p.default,
             'unit': p.unit, 'curve': p.curve, 'snap': p.snap,
         }) for p in FX_REVERB_PARAMS]
-        self.fx_sends = [False, False, True]  # 808, KICK, SYNTH send on/off
-        self.fx_send_amounts = [0.5, 0.5, 0.5]  # send level 0-1 per engine
+        # Indices align with self.voices: [sub808, kick, synth, sampler]
+        self.fx_sends = [False, False, True, False]
+        self.fx_send_amounts = [0.5, 0.5, 0.5, 0.5]
         self.fx_reverb_expanded = True
         self.fx_selected_param = 0
         self.fx_reverb_mode = 2  # HALL default
@@ -227,6 +260,15 @@ class Player:
         self.preview_buf = np.zeros(PREVIEW_SAMPLES, dtype=np.float32)
         self._preview_param_hash: int = 0
         self._preview_voice_idx: int = -1
+
+        # Sampler UI state
+        self.sampler_folder: str = ""
+        self.sampler_files: list = []
+        self.sampler_selected_file: int = 0
+        # BPM-edit debounce: slot_idx -> monotonic timestamp of last edit
+        self.sampler_bpm_dirty: dict[int, float] = {}
+        # Tap-tempo timestamps per slot (last few)
+        self.sampler_tap_history: dict[int, list[float]] = {}
 
     def _sync_reverb_from_params(self):
         """Push FX param values into the reverb DSP."""
@@ -260,9 +302,60 @@ class Player:
 
     @property
     def voice(self):
-        if self.voice_idx >= len(self.voices):
-            return self.voices[2]  # fallback to synth for FX/CHORD tabs
+        # Tabs: 0=808 1=KICK 2=SYNTH 3=FX 4=CHORD 5=SAMPLER
+        if self.voice_idx == SAMPLER_IDX:
+            return self.sampler
+        if self.voice_idx in (3, 4):
+            return self.synth  # fallback for FX/CHORD (no own voice)
         return self.voices[self.voice_idx]
+
+    # ── Sampler helpers ──
+    def sampler_open_folder(self, folder=None) -> bool:
+        if folder is None:
+            folder = pick_folder_dialog(initial=self.sampler_folder or None)
+        if not folder:
+            return False
+        self.sampler_folder = folder
+        self.sampler_files = scan_folder(folder)
+        self.sampler_selected_file = 0
+        return True
+
+    def sampler_load_selected_to(self, slot_idx: int) -> bool:
+        if not self.sampler_files:
+            return False
+        idx = max(0, min(len(self.sampler_files) - 1, self.sampler_selected_file))
+        path = self.sampler_files[idx]
+        try:
+            data, sr, meta = load_sample_with_meta(path)
+        except Exception:
+            return False
+        with self.lock:
+            slot = self.sampler.slots[slot_idx]
+            slot.load(
+                path.name, str(path), data, sr,
+                sample_bpm=float(meta.get("bpm", 0.0)),
+                bpm_confidence=float(meta.get("confidence", 0.0)),
+                user_corrected=bool(meta.get("user_corrected", False)),
+            )
+            # Auto-pre-select Match when confidence high + ratio reasonable
+            proj_bpm = self.project.bpm
+            if (slot.sample_bpm > 0 and proj_bpm > 0
+                    and slot.bpm_confidence >= 0.6):
+                ratio = slot.sample_bpm / proj_bpm
+                if 0.85 <= ratio <= 1.15:
+                    slot.match_mode = True
+        return True
+
+    def sampler_persist_slot_meta(self, slot_idx: int) -> None:
+        """Write current slot BPM/user_corrected back to sidecar JSON."""
+        slot = self.sampler.slots[slot_idx]
+        if not slot.loaded or not slot.path:
+            return
+        write_sidecar(slot.path, {
+            "bpm": float(slot.sample_bpm),
+            "confidence": float(slot.bpm_confidence),
+            "user_corrected": bool(slot.user_corrected),
+        })
 
     @property
     def voice_name(self):
@@ -283,6 +376,8 @@ class Player:
                         buf += voice_out
             if self.reverb_on:
                 buf += self.reverb.process(fx_bus)
+            # Metronome click: dry, no reverb send
+            buf += self.metronome.process(frames)
             peak = np.max(np.abs(buf))
             if peak > 1.0:
                 buf /= peak
@@ -483,12 +578,18 @@ class Player:
         self._preview_param_hash = h
         self._preview_voice_idx = self.voice_idx
         if self.voice_idx == 0:
+            # 808 preview: trigger → 150ms hold → release → 1.2s tail, so BODY
+            # + RELEASE shape is fully visible in the waveform.
             tmp = Sub808Voice(SR)
             for i, p in enumerate(self.sub808.params):
                 tmp.params[i].value = p.value
             tmp.trigger(36, 0.9)
-            full = tmp.process(6000)
-            self.preview_buf = full
+            pre = int(0.15 * SR)
+            post = int(1.2 * SR)
+            buf_a = tmp.process(pre)
+            tmp.release(36)
+            buf_b = tmp.process(post)
+            self.preview_buf = np.concatenate([buf_a, buf_b]).astype(np.float32)
         elif self.voice_idx == 1:
             tmp = KickVoice(SR)
             for i, p in enumerate(self.kick.params):
@@ -594,6 +695,76 @@ def _format_fx_param(p):
     elif p.unit == "%":
         return f"{p.value * 100:.0f}%"
     return f"{val:.2f}"
+
+
+def _draw_metronome_strip(screen, fonts, player, hit):
+    """Global metronome strip: play/pause + big BPM + nudge + beat flash.
+
+    Positioned as a full-width band just above the help line.
+    """
+    font, font_bold, font_lg, font_title = fonts
+    mouse_pos = pygame.mouse.get_pos()
+    metro = player.metronome
+
+    # Strip band
+    strip_top = WIN_H - 18 - METRO_STRIP_H
+    strip_rect = pygame.Rect(0, strip_top, WIN_W, METRO_STRIP_H)
+    pygame.draw.rect(screen, (18, 18, 30), strip_rect)
+    pygame.draw.rect(screen, DIM, strip_rect, 1)
+
+    center_y = strip_top + METRO_STRIP_H // 2
+
+    # Play/pause button (left)
+    play_label = "[▶]" if not metro.running else "[⏸]"
+    play_color = GREEN if metro.running else CYAN
+    ps = font_title.render(play_label, True, play_color)
+    pr = ps.get_rect(midleft=(14, center_y))
+    pc = pr.inflate(16, 10)
+    if pc.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (35, 35, 60), pc, border_radius=6)
+    screen.blit(ps, pr)
+    hit["metro_play"] = pc
+
+    # BPM label
+    lbl = font.render("BPM", True, DIM)
+    screen.blit(lbl, (pr.right + 22, center_y - lbl.get_height() // 2))
+
+    # Big BPM value
+    bpm_text = f"{player.project.bpm:.1f}"
+    bs = font_title.render(bpm_text, True, TEXT)
+    bx = pr.right + 62
+    br = bs.get_rect(midleft=(bx, center_y))
+    # Beat-flash halo
+    import time as _t
+    flash_age = _t.monotonic() - metro.last_tick_time
+    if metro.running and flash_age < 0.12:
+        alpha = int(255 * (1.0 - flash_age / 0.12))
+        halo = pygame.Rect(br.x - 6, br.y - 2, br.width + 12, br.height + 4)
+        pygame.draw.rect(screen, (60, 200, 120), halo, 2, border_radius=6)
+    screen.blit(bs, br)
+    hit["metro_bpm_value"] = br.inflate(12, 8)
+
+    # − / + nudge buttons (1 BPM per click, hold-to-edit shift for 0.1)
+    ns = font_lg.render("[−]", True, CYAN)
+    nr = ns.get_rect(midleft=(br.right + 16, center_y))
+    nc = nr.inflate(10, 8)
+    if nc.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (35, 35, 60), nc, border_radius=4)
+    screen.blit(ns, nr)
+    hit["metro_bpm_minus"] = nc
+
+    ps2 = font_lg.render("[+]", True, CYAN)
+    pr2 = ps2.get_rect(midleft=(nr.right + 8, center_y))
+    pc2 = pr2.inflate(10, 8)
+    if pc2.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (35, 35, 60), pc2, border_radius=4)
+    screen.blit(ps2, pr2)
+    hit["metro_bpm_plus"] = pc2
+
+    # Right-side hint
+    hint = "shift+click = ±0.1"
+    hs = font.render(hint, True, DIM)
+    screen.blit(hs, (WIN_W - hs.get_width() - 14, center_y - hs.get_height() // 2))
 
 
 def _draw_midi_keyboard(screen, fonts, player, hit, y):
@@ -747,8 +918,8 @@ def _draw_send_controls(screen, fonts, player, hit, y):
     font, font_bold, font_lg, font_title = fonts
     mouse_pos = pygame.mouse.get_pos()
 
-    engine_idx = player.voice_idx
-    if engine_idx >= len(player.fx_sends):
+    engine_idx = tab_voice_idx(player.voice_idx)
+    if engine_idx is None or engine_idx >= len(player.fx_sends):
         return y
 
     send_on = player.fx_sends[engine_idx]
@@ -912,6 +1083,489 @@ def _draw_fx_panel(screen, fonts, player, mouse_pos, hit, y):
         y += 34
 
     return y
+
+
+def _draw_sampler_bpm_row(screen, fonts, player, slot, mouse_pos, hit, y):
+    """BPM status line + fine-tune row for the focused sampler slot.
+
+    Layout:
+        Sample: 92 · Project: 140 · [Free] [Match]
+        (when Match on) Sample BPM: 92.0 [−][+] ×2 ÷2 [Tap]
+    """
+    font, font_bold, _, _ = fonts
+    proj_bpm = player.project.bpm
+    sample_bpm = slot.sample_bpm
+    conf = slot.bpm_confidence
+    has_bpm = sample_bpm > 0.0
+
+    # ── Line 1: Sample/Project badges + Match/Free toggle ──────────────
+    cx = 20
+    screen.blit(font.render("Sample:", True, DIM), (cx, y + 2))
+    cx += 60
+    bpm_text = f"{sample_bpm:5.1f}" if has_bpm else "?"
+    bpm_color = GREEN if has_bpm and conf >= 0.6 else (YELLOW if has_bpm else RED)
+    screen.blit(font_bold.render(bpm_text, True, bpm_color), (cx, y + 2))
+    cx += 60
+    screen.blit(font.render("·  Project:", True, DIM), (cx, y + 2))
+    cx += 78
+    screen.blit(font_bold.render(f"{proj_bpm:5.1f}", True, CYAN), (cx, y + 2))
+    cx += 70
+
+    # Free / Match toggle (disabled if no BPM)
+    free_color = CYAN if not slot.match_mode else DIM
+    match_color = CYAN if slot.match_mode else DIM
+    if not has_bpm:
+        match_color = (80, 80, 80)
+    fs = font_bold.render("[Free]", True, free_color)
+    fr = fs.get_rect(topleft=(cx, y))
+    fc = fr.inflate(10, 6)
+    if fc.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (35, 35, 60), fc, border_radius=4)
+    screen.blit(fs, fr)
+    hit["sampler_bpm_free"] = fc
+    cx += fr.width + 14
+    ms = font_bold.render("[Match]", True, match_color)
+    mr = ms.get_rect(topleft=(cx, y))
+    mc = mr.inflate(10, 6)
+    if mc.collidepoint(mouse_pos) and has_bpm:
+        pygame.draw.rect(screen, (35, 35, 60), mc, border_radius=4)
+    screen.blit(ms, mr)
+    hit["sampler_bpm_match"] = mc
+    cx += mr.width + 14
+
+    # Tap tempo fallback when no BPM or user wants to re-detect
+    if not has_bpm:
+        ts = font_bold.render("[Tap tempo]", True, YELLOW)
+        tr = ts.get_rect(topleft=(cx, y))
+        tc = tr.inflate(10, 6)
+        if tc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (60, 60, 35), tc, border_radius=4)
+        screen.blit(ts, tr)
+        hit["sampler_bpm_tap"] = tc
+    y += 24
+
+    # ── Line 2: fine-tune (only when Match active) ─────────────────────
+    if slot.match_mode and has_bpm:
+        cx = 20
+        screen.blit(font.render("Sample BPM:", True, DIM), (cx, y + 2))
+        cx += 90
+        val_txt = f"{sample_bpm:5.1f}"
+        vcol = CYAN if slot.user_corrected else TEXT
+        screen.blit(font_bold.render(val_txt, True, vcol), (cx, y + 2))
+        cx += 50
+        for label, key in (("[−]", "sampler_bpm_minus"),
+                            ("[+]", "sampler_bpm_plus")):
+            bs = font_bold.render(label, True, CYAN)
+            br = bs.get_rect(topleft=(cx, y))
+            bc = br.inflate(8, 6)
+            if bc.collidepoint(mouse_pos):
+                pygame.draw.rect(screen, (35, 35, 60), bc, border_radius=4)
+            screen.blit(bs, br)
+            hit[key] = bc
+            cx += br.width + 6
+        cx += 6
+        for label, key in (("×2", "sampler_bpm_double"),
+                            ("÷2", "sampler_bpm_half")):
+            bs = font_bold.render(label, True, YELLOW)
+            br = bs.get_rect(topleft=(cx, y))
+            bc = br.inflate(10, 6)
+            if bc.collidepoint(mouse_pos):
+                pygame.draw.rect(screen, (60, 60, 35), bc, border_radius=4)
+            screen.blit(bs, br)
+            hit[key] = bc
+            cx += br.width + 10
+        cx += 4
+        ts = font_bold.render("[Tap]", True, YELLOW)
+        tr = ts.get_rect(topleft=(cx, y))
+        tc = tr.inflate(10, 6)
+        if tc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (60, 60, 35), tc, border_radius=4)
+        screen.blit(ts, tr)
+        hit["sampler_bpm_tap"] = tc
+        y += 22
+    return y
+
+
+def _draw_sampler_panel(screen, fonts, player, mouse_pos, hit, y):
+    """SAMPLER tab UI: folder picker, file list, 4x4 pad grid, load-to-pad."""
+    font, font_bold, _, _ = fonts
+    sampler = player.sampler
+
+    # Folder row + LOAD FOLDER button
+    folder_label = player.sampler_folder or "(no folder — click LOAD FOLDER)"
+    screen.blit(font.render(f"Folder: {folder_label}", True, TEXT), (20, y))
+    lf_surf = font_bold.render("[LOAD FOLDER]", True, CYAN)
+    lf_rect = lf_surf.get_rect(topright=(WIN_W - 20, y))
+    lf_click = lf_rect.inflate(10, 8)
+    if lf_click.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (35, 35, 60), lf_click, border_radius=4)
+    screen.blit(lf_surf, lf_rect)
+    hit["sampler_load_folder"] = lf_click
+    y += 26
+
+    # File list (left 2/3) + pad grid (right 1/3)
+    list_x, list_w = 20, int(WIN_W * 0.60)
+    list_h = 210
+    pygame.draw.rect(screen, (20, 20, 35), (list_x, y, list_w, list_h), border_radius=6)
+    pygame.draw.rect(screen, DIM, (list_x, y, list_w, list_h), 1, border_radius=6)
+
+    files = player.sampler_files
+    if not files:
+        screen.blit(font.render("No audio files. Pick a folder with .wav files.",
+                                True, DIM), (list_x + 12, y + 12))
+    else:
+        row_h = 18
+        max_rows = (list_h - 12) // row_h
+        start_idx = max(0, player.sampler_selected_file - max_rows // 2)
+        end_idx = min(len(files), start_idx + max_rows)
+        for i, path in enumerate(files[start_idx:end_idx]):
+            ri = start_idx + i
+            row_y = y + 6 + i * row_h
+            row_rect = pygame.Rect(list_x + 4, row_y, list_w - 8, row_h)
+            if ri == player.sampler_selected_file:
+                pygame.draw.rect(screen, (40, 40, 70), row_rect, border_radius=3)
+                color = YELLOW
+            else:
+                color = TEXT
+            screen.blit(font.render(path.name, True, color), (list_x + 10, row_y + 1))
+            hit[f"sampler_file_{ri}"] = row_rect
+
+    # 4x4 pad grid (right)
+    right_x = list_x + list_w + 10
+    right_w = WIN_W - right_x - 20
+    grid_h = 160
+    pad_w = (right_w - 4 * 3) // 4
+    pad_h = (grid_h - 4 * 3) // 4
+    for r in range(4):
+        for c in range(4):
+            idx = r * 4 + c
+            px = right_x + c * (pad_w + 4)
+            py = y + r * (pad_h + 4)
+            slot = sampler.slots[idx]
+            focused = idx == sampler.focused_slot_idx
+            loaded = slot.loaded
+            bg = (60, 130, 100) if loaded else (35, 35, 55)
+            if focused:
+                bg = (100, 180, 140) if loaded else (80, 80, 110)
+            pygame.draw.rect(screen, bg, (px, py, pad_w, pad_h), border_radius=4)
+            pygame.draw.rect(screen, DIM, (px, py, pad_w, pad_h), 1, border_radius=4)
+            lbl = font_bold.render(f"{idx+1}", True, TEXT if loaded else DIM)
+            screen.blit(lbl, (px + 4, py + 2))
+            if loaded:
+                name = slot.name
+                if len(name) > 10:
+                    name = name[:9] + "…"
+                screen.blit(font.render(name, True, (230, 230, 240)),
+                            (px + 4, py + 20))
+            hit[f"sampler_pad_{idx}"] = pygame.Rect(px, py, pad_w, pad_h)
+
+    # LOAD → PAD + CLEAR buttons under the grid
+    after_y = y + grid_h + 6
+    ld_surf = font_bold.render(
+        f"[LOAD → PAD {sampler.focused_slot_idx + 1}]", True, GREEN)
+    ld_rect = ld_surf.get_rect(topleft=(right_x, after_y))
+    ld_click = ld_rect.inflate(10, 8)
+    if ld_click.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (40, 60, 50), ld_click, border_radius=4)
+    screen.blit(ld_surf, ld_rect)
+    hit["sampler_load_to_pad"] = ld_click
+
+    cl_surf = font_bold.render("[CLEAR PAD]", True, RED)
+    cl_rect = cl_surf.get_rect(topleft=(right_x, after_y + 22))
+    cl_click = cl_rect.inflate(10, 8)
+    if cl_click.collidepoint(mouse_pos):
+        pygame.draw.rect(screen, (60, 35, 40), cl_click, border_radius=4)
+    screen.blit(cl_surf, cl_rect)
+    hit["sampler_clear_pad"] = cl_click
+
+    y += list_h + 12
+
+    # Info line
+    st = sampler.get_state()
+    info = (f"Pad {st['focused_slot']+1}: {st['focused_name'] or '(empty)'}   "
+            f"Active: {st['active_voices']}/{st['max_voices']}   "
+            f"Loaded: {st['slots_loaded']}/16")
+    screen.blit(font.render(info, True, DIM), (20, y))
+    y += 20
+
+    # BPM status line + fine-tune row
+    slot_for_bpm = sampler.slots[sampler.focused_slot_idx]
+    if slot_for_bpm.loaded:
+        y = _draw_sampler_bpm_row(screen, fonts, player, slot_for_bpm,
+                                  mouse_pos, hit, y)
+
+    # MODE radios + REVERSE toggle + FREEZE arm (only when slot loaded)
+    slot = sampler.slots[sampler.focused_slot_idx]
+    if slot.loaded:
+        from cypher.sampler.sampler import (
+            MODE_NAMES as _SMN, P_MODE as _PM, P_REVERSE as _PR,
+        )
+        # MODE row
+        cur_mode = int(round(slot.params[_PM].mapped))
+        cx = 20
+        screen.blit(font.render("MODE:", True, TEXT), (cx, y + 4))
+        cx += 58
+        for mi, name in enumerate(_SMN):
+            sel = mi == cur_mode
+            color = CYAN if sel else DIM
+            label = f"[{name}]" if sel else f" {name} "
+            ms = font_bold.render(label, True, color)
+            mr = ms.get_rect(topleft=(cx, y))
+            mc = mr.inflate(8, 6)
+            if mc.collidepoint(mouse_pos) and not sel:
+                pygame.draw.rect(screen, (35, 35, 60), mc, border_radius=4)
+            screen.blit(ms, mr)
+            hit[f"sampler_mode_{mi}"] = mc
+            cx += mr.width + 14
+
+        # REVERSE toggle (right side)
+        rev_on = int(round(slot.params[_PR].mapped)) == 1
+        rev_color = GREEN if rev_on else DIM
+        rev_label = "[REV: ON]" if rev_on else "[REV]"
+        rs = font_bold.render(rev_label, True, rev_color)
+        rr = rs.get_rect(topright=(WIN_W - 20, y))
+        rc = rr.inflate(10, 6)
+        if rc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (35, 35, 60), rc, border_radius=4)
+        screen.blit(rs, rr)
+        hit["sampler_reverse"] = rc
+
+        # FREEZE arm (next to REV)
+        fz_on = slot.freeze_armed
+        fz_color = MAGENTA if fz_on else DIM
+        fz_label = "[FREEZE: ARMED]" if fz_on else "[FREEZE]"
+        fs = font_bold.render(fz_label, True, fz_color)
+        fr = fs.get_rect(topright=(rr.left - 10, y))
+        fc = fr.inflate(10, 6)
+        if fc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (50, 35, 50), fc, border_radius=4)
+        screen.blit(fs, fr)
+        hit["sampler_freeze_arm"] = fc
+        y += 26
+
+        # Gross Beat preset row
+        from cypher.sampler.gross_beat import PRESET_NAMES as _GBN
+        cur_gb = sampler.gross_beat.preset
+        gx = 20
+        screen.blit(font.render("GROSS:", True, TEXT), (gx, y + 4))
+        gx += 66
+        for gi, name in enumerate(_GBN):
+            sel = gi == cur_gb
+            color = GREEN if sel else DIM
+            label = f"[{name}]" if sel else f" {name} "
+            gs = font_bold.render(label, True, color)
+            gr = gs.get_rect(topleft=(gx, y))
+            gc = gr.inflate(6, 6)
+            if gc.collidepoint(mouse_pos) and not sel:
+                pygame.draw.rect(screen, (35, 35, 60), gc, border_radius=4)
+            screen.blit(gs, gr)
+            hit[f"sampler_gross_{gi}"] = gc
+            gx += gr.width + 8
+        y += 26
+
+        # PITCH / GAIN / SLICES slider row
+        from cypher.sampler.sampler import (
+            P_PITCH as _PP, P_GAIN as _PG, P_SLICES as _PSL,
+            P_FZ_POS as _PFP, P_FZ_GRAIN as _PFG,
+            P_FZ_MOTION as _PFM, P_FZ_RATE as _PFR,
+            DIVISION_NAMES as _DIV_NAMES, DIVISION_VALUES as _DIV_VALS,
+            MODE_CHOP as _MC,
+        )
+
+        def _slider(sx, sy, sw, label, param, key, fmt):
+            screen.blit(font.render(label, True, TEXT), (sx, sy))
+            screen.blit(font.render(fmt(param), True, YELLOW), (sx + 70, sy))
+            track_y = sy + 17
+            pygame.draw.rect(screen, SLIDER_BG, (sx, track_y, sw, 10),
+                             border_radius=4)
+            fill = max(0, min(int(param.value * sw), sw))
+            if fill > 0:
+                pygame.draw.rect(screen, (60, 130, 100),
+                                 (sx, track_y, fill, 10), border_radius=4)
+            pygame.draw.circle(screen, TEXT, (sx + fill, track_y + 5), 6)
+            hit[key] = pygame.Rect(sx, track_y - 6, sw, 22)
+
+        # PITCH as +/- buttons (discrete semitones)
+        slider_w = (WIN_W - 40 - 60) // 3
+        pitch_p = slot.params[_PP]
+        pitch_st = pitch_p.mapped
+        px = 20
+        screen.blit(font.render("PITCH", True, TEXT), (px, y))
+        minus = font_bold.render("[−1]", True, CYAN)
+        mr = minus.get_rect(topleft=(px + 60, y))
+        mc = mr.inflate(8, 6)
+        if mc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (35, 35, 60), mc, border_radius=4)
+        screen.blit(minus, mr)
+        hit["sampler_pitch_minus"] = mc
+        val_txt = f"{pitch_st:+.0f} st"
+        screen.blit(font_bold.render(val_txt, True, YELLOW),
+                    (px + 110, y + 2))
+        plus = font_bold.render("[+1]", True, CYAN)
+        pr = plus.get_rect(topleft=(px + 170, y))
+        pc = pr.inflate(8, 6)
+        if pc.collidepoint(mouse_pos):
+            pygame.draw.rect(screen, (35, 35, 60), pc, border_radius=4)
+        screen.blit(plus, pr)
+        hit["sampler_pitch_plus"] = pc
+
+        _slider(20 + slider_w + 30, y, slider_w, "GAIN", slot.params[_PG],
+                "sampler_gain_slider", lambda p: f"{p.mapped:.2f}")
+        _slider(20 + 2 * (slider_w + 30), y, slider_w, "SLICES",
+                slot.params[_PSL], "sampler_slices_slider",
+                lambda p: f"{int(round(p.mapped))}")
+        y += 32
+
+        # Beat-division row (CHOP mode only). Sets SLICES to (beats × division).
+        if slot.mode == _MC:
+            bpm = player.project.bpm
+            sec = slot.length / max(1, slot.source_rate)
+            beats = max(1.0, sec * bpm / 60.0)
+            dx = 20
+            screen.blit(font.render("DIVISION:", True, TEXT), (dx, y + 4))
+            dx += 82
+            for di, name in enumerate(_DIV_NAMES):
+                target = int(min(32, max(1, round(beats * _DIV_VALS[di]))))
+                ds = font_bold.render(f"[{name}]", True, CYAN)
+                dr = ds.get_rect(topleft=(dx, y))
+                dc = dr.inflate(6, 6)
+                if dc.collidepoint(mouse_pos):
+                    pygame.draw.rect(screen, (35, 35, 60), dc, border_radius=4)
+                screen.blit(ds, dr)
+                hit[f"sampler_div_{di}"] = dc
+                dx += dr.width + 6
+            y += 26
+
+        # FREEZE sub-panel (only when armed)
+        if slot.freeze_armed:
+            mot_idx = max(0, min(3, int(round(slot.params[_PFM].mapped))))
+            mx = 20
+            screen.blit(font.render("MOTION:", True, TEXT), (mx, y + 4))
+            mx += 72
+            from cypher.sampler.freeze import MOTION_NAMES as _FZMN
+            for mi, mname in enumerate(_FZMN):
+                sel = mi == mot_idx
+                color = MAGENTA if sel else DIM
+                label = f"[{mname}]" if sel else f" {mname} "
+                ms = font_bold.render(label, True, color)
+                mr = ms.get_rect(topleft=(mx, y))
+                mc = mr.inflate(6, 6)
+                if mc.collidepoint(mouse_pos) and not sel:
+                    pygame.draw.rect(screen, (50, 35, 50), mc, border_radius=4)
+                screen.blit(ms, mr)
+                hit[f"sampler_fz_motion_{mi}"] = mc
+                mx += mr.width + 6
+            y += 26
+
+            rate_label = {0: "RATE (—)", 1: "DRIFT",
+                          2: "SWING Hz", 3: "DECAY s"}.get(mot_idx, "RATE")
+            _slider(20, y, slider_w, "FZ POS", slot.params[_PFP],
+                    "sampler_fz_pos_slider",
+                    lambda p: f"{int(p.mapped * 100)}%")
+            _slider(20 + slider_w + 30, y, slider_w, "FZ GRAIN",
+                    slot.params[_PFG], "sampler_fz_grain_slider",
+                    lambda p: f"{int(p.mapped)}ms")
+            _slider(20 + 2 * (slider_w + 30), y, slider_w, rate_label,
+                    slot.params[_PFR], "sampler_fz_rate_slider",
+                    lambda p: f"{p.value:.2f}")
+            y += 32
+
+    # Waveform view of focused slot (full width)
+    _draw_sampler_waveform(screen, fonts, sampler, 20, y, WIN_W - 40, 130)
+    y += 138
+
+    # Key hint
+    hint = ("Keys: A W S E D F T G Y H U J K → pads/slices 1–13 · "
+            "Z/X = shift pad group (oct±) for 13–16")
+    screen.blit(font.render(hint, True, DIM), (20, y))
+    y += 18
+
+    return y
+
+
+def _draw_sampler_waveform(screen, fonts, sampler, x, y, w, h):
+    """Waveform view of focused slot with START/END handles + slice markers."""
+    import numpy as np
+    font = fonts[0]
+    pygame.draw.rect(screen, (12, 12, 22), (x, y, w, h), border_radius=6)
+    pygame.draw.rect(screen, (40, 40, 65), (x, y, w, h), 1, border_radius=6)
+
+    slot = sampler.slots[sampler.focused_slot_idx]
+    center_y = y + h // 2
+
+    if not slot.loaded or slot.length < 2:
+        msg = f"Pad {sampler.focused_slot_idx + 1} — no sample loaded"
+        tx = x + (w - font.size(msg)[0]) // 2
+        screen.blit(font.render(msg, True, DIM), (tx, center_y - 8))
+        return
+
+    # Center guide
+    for gx in range(x + 4, x + w - 4, 4):
+        screen.set_at((gx, center_y), (40, 40, 65))
+
+    # Peak-envelope waveform (mirrored)
+    data = slot.data
+    n = len(data)
+    display_w = w - 12
+    bucket = max(1, n // display_w)
+    usable = (n // bucket) * bucket
+    if usable > 0:
+        peaks = np.max(np.abs(data[:usable].reshape(-1, bucket)), axis=1)
+    else:
+        peaks = np.abs(data)
+    if len(peaks) < display_w:
+        peaks = np.pad(peaks, (0, display_w - len(peaks)))
+    else:
+        peaks = peaks[:display_w]
+    pk_max = float(np.max(peaks)) if len(peaks) else 1.0
+    if pk_max > 0.001:
+        peaks = peaks / pk_max
+
+    half_h = (h - 16) / 2.0
+    base_x = x + 6
+    col = (200, 215, 235)
+    for i, p in enumerate(peaks):
+        px = base_x + i
+        amp = int(p * half_h)
+        if amp < 1:
+            screen.set_at((px, center_y), (60, 70, 90))
+        else:
+            pygame.draw.line(screen, col, (px, center_y - amp), (px, center_y + amp), 1)
+
+    # START (green) / END (yellow) vertical lines
+    from cypher.sampler.sampler import P_START, P_END, MODE_CHOP
+    p_start = max(0.0, min(1.0, slot.params[P_START].mapped))
+    p_end = max(0.0, min(1.0, slot.params[P_END].mapped))
+    sx_pix = base_x + int(p_start * (display_w - 1))
+    ex_pix = base_x + int(p_end * (display_w - 1))
+    pygame.draw.line(screen, GREEN, (sx_pix, y + 4), (sx_pix, y + h - 4), 1)
+    pygame.draw.line(screen, YELLOW, (ex_pix, y + 4), (ex_pix, y + h - 4), 1)
+
+    # CHOP slice boundary lines (magenta) + slice numbers
+    if slot.mode == MODE_CHOP:
+        slot.refresh_slices()
+        n_slices = len(slot._slice_points)
+        for si, (s_start, _) in enumerate(slot._slice_points):
+            frac = s_start / max(1, slot.length)
+            sx = base_x + int(frac * (display_w - 1))
+            if si > 0:
+                pygame.draw.line(screen, MAGENTA, (sx, y + 4), (sx, y + h - 4), 1)
+            if n_slices <= 16 and display_w // max(1, n_slices) > 20:
+                screen.blit(font.render(str(si + 1), True, MAGENTA), (sx + 2, y + 4))
+
+    # Live playhead for any voice playing this slot
+    for v in sampler._voices:
+        if v.is_active and v.slot is slot:
+            pos_frac = max(0.0, min(1.0, v._position / max(1, slot.length)))
+            ph_x = base_x + int(pos_frac * (display_w - 1))
+            pygame.draw.line(screen, CYAN, (ph_x, y + 2), (ph_x, y + h - 2), 1)
+            break
+
+    # Duration label top-right
+    dur_sec = slot.length / max(1, slot.source_rate)
+    dur_str = f"{dur_sec*1000:.0f}ms" if dur_sec < 1 else f"{dur_sec:.2f}s"
+    lbl = font.render(dur_str, True, DIM)
+    screen.blit(lbl, (x + w - lbl.get_width() - 8, y + 4))
 
 
 def _draw_chord_panel(screen, fonts, player, mouse_pos, hit, y):
@@ -1117,7 +1771,7 @@ def draw(screen, fonts, player, held_notes, held_chord_key, held_chord_notes):
         y = _draw_fx_panel(screen, fonts, player, mouse_pos, hit, y)
         y += 4
         # Per-engine send status
-        for i, ename in enumerate(["808", "KICK", "SYNTH"]):
+        for i, ename in enumerate(["808", "KICK", "SYNTH", "SAMPLER"]):
             send_on = player.fx_sends[i]
             send_amt = player.fx_send_amounts[i]
             sc = GREEN if send_on else DIM
@@ -1128,6 +1782,9 @@ def draw(screen, fonts, player, held_notes, held_chord_key, held_chord_notes):
     # ── CHORD tab: custom UI ──
     elif player.voice_idx == 4:
         y = _draw_chord_panel(screen, fonts, player, mouse_pos, hit, y)
+
+    elif player.voice_idx == SAMPLER_IDX:
+        y = _draw_sampler_panel(screen, fonts, player, mouse_pos, hit, y)
 
     # ── Normal engine UI (808 / KICK / SYNTH) ──
     elif player.voice_idx < 3:
@@ -1263,8 +1920,11 @@ def draw(screen, fonts, player, held_notes, held_chord_key, held_chord_notes):
             y += 22
 
     # ── Global MIDI keyboard (always visible) ──
-    y = max(y, WIN_H - MIDI_KB_H - 50)
+    y = max(y, WIN_H - MIDI_KB_H - METRO_STRIP_H - 50)
     y = _draw_midi_keyboard(screen, fonts, player, hit, y)
+
+    # ── Global metronome strip (always visible) ──
+    _draw_metronome_strip(screen, fonts, player, hit)
 
     # ── Help line ──
     help_str = "TAB voice  SPACE trigger  A-K chromatic  Z/X oct  C chord  Q quit"
@@ -1446,6 +2106,22 @@ def main():
                         held_chord_key = True
                         held_chord_notes = notes
 
+                    elif player.voice_idx == SAMPLER_IDX and key in CHROMATIC_KEYS \
+                         and key not in held_notes:
+                        # A-K chromatic → pads 0..12 with octave shift (Z/X).
+                        # Octave 2 is the base (A = pad 0); Octave 3 shifts
+                        # by +12 to reach pads 12-15. Anything past 15 clamps.
+                        semi = CHROMATIC_KEYS[key]
+                        pad_idx = semi + (player.octave - 2) * 12
+                        if 0 <= pad_idx < 16:
+                            midi_note = PAD_MIDI_START + pad_idx
+                            with player.lock:
+                                player.sampler.trigger_pad(pad_idx, midi_note, 0.9)
+                            if player.sampler.slots[pad_idx].loaded:
+                                player.sampler.focus_slot(pad_idx)
+                            player.active_midi_notes.add(midi_note)
+                            held_notes[key] = midi_note
+
                     elif key == pygame.K_SPACE and key not in held_notes:
                         midi_note = player.octave * 12 + 24
                         if player.voice_idx < 3:
@@ -1539,6 +2215,21 @@ def main():
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mx, my = event.pos
 
+                    # Metronome strip (always-on, any tab)
+                    mods = pygame.key.get_mods()
+                    nudge = 0.1 if (mods & pygame.KMOD_SHIFT) else 1.0
+                    r = hit.get("metro_play")
+                    if r and r.collidepoint(mx, my):
+                        player.metronome.toggle()
+                    r = hit.get("metro_bpm_minus")
+                    if r and r.collidepoint(mx, my):
+                        player.project.bpm = max(20.0, player.project.bpm - nudge)
+                        player.metronome.reset_phase()
+                    r = hit.get("metro_bpm_plus")
+                    if r and r.collidepoint(mx, my):
+                        player.project.bpm = min(300.0, player.project.bpm + nudge)
+                        player.metronome.reset_phase()
+
                     # Engine tabs
                     for i in range(len(VOICE_NAMES)):
                         r = hit.get(f"engine_{i}")
@@ -1570,16 +2261,195 @@ def main():
                         if not player.reverb_on:
                             player.reverb.clear()
 
+                    # SAMPLER tab clicks
+                    if player.voice_idx == SAMPLER_IDX:
+                        r = hit.get("sampler_load_folder")
+                        if r and r.collidepoint(mx, my):
+                            player.sampler_open_folder()
+
+                        for fi in range(len(player.sampler_files)):
+                            r = hit.get(f"sampler_file_{fi}")
+                            if r and r.collidepoint(mx, my):
+                                player.sampler_selected_file = fi
+                                break
+
+                        for pi in range(16):
+                            r = hit.get(f"sampler_pad_{pi}")
+                            if r and r.collidepoint(mx, my):
+                                player.sampler.focus_slot(pi)
+                                if player.sampler.slots[pi].loaded:
+                                    with player.lock:
+                                        player.sampler.trigger_pad(
+                                            pi, PAD_MIDI_START + pi, 0.9)
+                                break
+
+                        r = hit.get("sampler_load_to_pad")
+                        if r and r.collidepoint(mx, my):
+                            player.sampler_load_selected_to(
+                                player.sampler.focused_slot_idx)
+
+                        r = hit.get("sampler_clear_pad")
+                        if r and r.collidepoint(mx, my):
+                            with player.lock:
+                                player.sampler.clear_slot(
+                                    player.sampler.focused_slot_idx)
+
+                        # MODE radios, REVERSE, FREEZE, GROSS BEAT
+                        slot_f = player.sampler.slots[player.sampler.focused_slot_idx]
+                        from cypher.sampler.sampler import (
+                            MODE_NAMES as _SMN, P_MODE as _PM, P_REVERSE as _PR,
+                        )
+                        from cypher.sampler.gross_beat import PRESET_NAMES as _GBN
+                        for mi in range(len(_SMN)):
+                            r = hit.get(f"sampler_mode_{mi}")
+                            if r and r.collidepoint(mx, my):
+                                slot_f.params[_PM].value = mi / max(1, len(_SMN) - 1)
+                                break
+
+                        r = hit.get("sampler_reverse")
+                        if r and r.collidepoint(mx, my):
+                            cur = int(round(slot_f.params[_PR].mapped))
+                            slot_f.params[_PR].value = 0.0 if cur == 1 else 1.0
+
+                        r = hit.get("sampler_freeze_arm")
+                        if r and r.collidepoint(mx, my):
+                            slot_f.freeze_armed = not slot_f.freeze_armed
+
+                        # BPM match/free toggle
+                        r = hit.get("sampler_bpm_free")
+                        if r and r.collidepoint(mx, my):
+                            slot_f.match_mode = False
+                        r = hit.get("sampler_bpm_match")
+                        if r and r.collidepoint(mx, my) and slot_f.sample_bpm > 0:
+                            slot_f.match_mode = True
+
+                        # BPM nudge −/+ (invalidate cache; persist after idle).
+                        # Debounced persist happens in the main loop.
+                        import time as _time
+                        _fsi = player.sampler.focused_slot_idx
+                        r = hit.get("sampler_bpm_minus")
+                        if r and r.collidepoint(mx, my) and slot_f.sample_bpm > 0:
+                            slot_f.sample_bpm = max(20.0, slot_f.sample_bpm - 0.1)
+                            slot_f.user_corrected = True
+                            slot_f.invalidate_bpm_cache()
+                            player.sampler_bpm_dirty[_fsi] = _time.monotonic()
+                        r = hit.get("sampler_bpm_plus")
+                        if r and r.collidepoint(mx, my) and slot_f.sample_bpm > 0:
+                            slot_f.sample_bpm = min(300.0, slot_f.sample_bpm + 0.1)
+                            slot_f.user_corrected = True
+                            slot_f.invalidate_bpm_cache()
+                            player.sampler_bpm_dirty[_fsi] = _time.monotonic()
+
+                        # ×2 / ÷2 (halftime/doubletime correction)
+                        r = hit.get("sampler_bpm_double")
+                        if r and r.collidepoint(mx, my) and slot_f.sample_bpm > 0:
+                            slot_f.sample_bpm = min(300.0, slot_f.sample_bpm * 2.0)
+                            slot_f.user_corrected = True
+                            slot_f.invalidate_bpm_cache()
+                            player.sampler_persist_slot_meta(player.sampler.focused_slot_idx)
+                        r = hit.get("sampler_bpm_half")
+                        if r and r.collidepoint(mx, my) and slot_f.sample_bpm > 0:
+                            slot_f.sample_bpm = max(20.0, slot_f.sample_bpm / 2.0)
+                            slot_f.user_corrected = True
+                            slot_f.invalidate_bpm_cache()
+                            player.sampler_persist_slot_meta(player.sampler.focused_slot_idx)
+
+                        # Tap tempo
+                        r = hit.get("sampler_bpm_tap")
+                        if r and r.collidepoint(mx, my):
+                            fs_idx = player.sampler.focused_slot_idx
+                            now_t = _time.monotonic()
+                            hist = player.sampler_tap_history.setdefault(fs_idx, [])
+                            if hist and now_t - hist[-1] > 2.5:
+                                hist.clear()
+                            hist.append(now_t)
+                            if len(hist) > 6:
+                                del hist[:-6]
+                            if len(hist) >= 2:
+                                intervals = [hist[i] - hist[i-1] for i in range(1, len(hist))]
+                                med = sorted(intervals)[len(intervals)//2]
+                                if 0.2 < med < 2.0:
+                                    slot_f.sample_bpm = 60.0 / med
+                                    slot_f.user_corrected = True
+                                    slot_f.invalidate_bpm_cache()
+                                    if not slot_f.match_mode:
+                                        slot_f.match_mode = True
+                                    player.sampler_persist_slot_meta(fs_idx)
+
+                        for gi in range(len(_GBN)):
+                            r = hit.get(f"sampler_gross_{gi}")
+                            if r and r.collidepoint(mx, my):
+                                player.sampler.gross_beat.preset = gi
+                                if gi == 0:
+                                    player.sampler.gross_beat.reset()
+                                break
+
+                        # Slider clicks (+ start drag)
+                        from cypher.sampler.sampler import (
+                            P_PITCH as _PP, P_GAIN as _PG, P_SLICES as _PSL,
+                            P_FZ_POS as _PFP, P_FZ_GRAIN as _PFG,
+                            P_FZ_MOTION as _PFM, P_FZ_RATE as _PFR,
+                            DIVISION_VALUES as _DIV_VALS,
+                        )
+                        # PITCH +/- buttons (1 semitone each)
+                        r = hit.get("sampler_pitch_minus")
+                        if r and r.collidepoint(mx, my):
+                            cur = slot_f.params[_PP].mapped
+                            new_st = max(-24.0, round(cur - 1.0))
+                            slot_f.params[_PP].value = (new_st + 24.0) / 48.0
+                        r = hit.get("sampler_pitch_plus")
+                        if r and r.collidepoint(mx, my):
+                            cur = slot_f.params[_PP].mapped
+                            new_st = min(24.0, round(cur + 1.0))
+                            slot_f.params[_PP].value = (new_st + 24.0) / 48.0
+
+                        for key, pidx in [
+                            ("sampler_gain_slider", _PG),
+                            ("sampler_slices_slider", _PSL),
+                            ("sampler_fz_pos_slider", _PFP),
+                            ("sampler_fz_grain_slider", _PFG),
+                            ("sampler_fz_rate_slider", _PFR),
+                        ]:
+                            r = hit.get(key)
+                            if r and r.collidepoint(mx, my):
+                                t = max(0.0, min(1.0, (mx - r.x) / max(1, r.width)))
+                                slot_f.params[pidx].value = t
+                                dragging_slider = key
+                                break
+
+                        # FREEZE motion radios
+                        from cypher.sampler.freeze import MOTION_NAMES as _FZMN
+                        for mi in range(len(_FZMN)):
+                            r = hit.get(f"sampler_fz_motion_{mi}")
+                            if r and r.collidepoint(mx, my):
+                                slot_f.params[_PFM].value = (
+                                    mi / max(1, len(_FZMN) - 1))
+                                break
+
+                        # Beat division → compute SLICES
+                        for di in range(len(_DIV_VALS)):
+                            r = hit.get(f"sampler_div_{di}")
+                            if r and r.collidepoint(mx, my):
+                                sec = slot_f.length / max(1, slot_f.source_rate)
+                                beats = max(1.0, sec * player.project.bpm / 60.0)
+                                target = int(min(32, max(1,
+                                    round(beats * _DIV_VALS[di]))))
+                                # snap=32 → value = (target-1)/31
+                                slot_f.params[_PSL].value = (target - 1) / 31.0
+                                slot_f.refresh_slices()
+                                break
+
                     # Send toggle (per-engine)
+                    _send_idx = tab_voice_idx(player.voice_idx)
                     r = hit.get("send_toggle")
-                    if r and r.collidepoint(mx, my) and player.voice_idx < len(player.fx_sends):
-                        player.fx_sends[player.voice_idx] = not player.fx_sends[player.voice_idx]
+                    if r and r.collidepoint(mx, my) and _send_idx is not None:
+                        player.fx_sends[_send_idx] = not player.fx_sends[_send_idx]
 
                     # Send slider drag
                     r = hit.get("send_slider")
-                    if r and r.collidepoint(mx, my) and player.voice_idx < len(player.fx_send_amounts):
+                    if r and r.collidepoint(mx, my) and _send_idx is not None:
                         t = max(0.0, min(1.0, (mx - r.x) / r.width))
-                        player.fx_send_amounts[player.voice_idx] = t
+                        player.fx_send_amounts[_send_idx] = t
                         dragging_slider = "send_slider"
 
                     # Key selector
@@ -1751,14 +2621,38 @@ def main():
                                 player.voice.params[page["params"][pi]].value = t
                     elif dragging_slider == "send_slider":
                         r = hit.get("send_slider")
-                        if r and player.voice_idx < len(player.fx_send_amounts):
+                        _si = tab_voice_idx(player.voice_idx)
+                        if r and _si is not None:
                             t = max(0.0, min(1.0, (mx_pos - r.x) / r.width))
-                            player.fx_send_amounts[player.voice_idx] = t
+                            player.fx_send_amounts[_si] = t
                     elif dragging_slider == "swing_slider":
                         r = hit.get("swing_slider")
                         if r:
                             t = max(0.0, min(1.0, (mx_pos - r.x) / r.width))
                             player.chord_swing = t
+                    elif dragging_slider in (
+                        "sampler_pitch_slider", "sampler_gain_slider",
+                        "sampler_slices_slider", "sampler_fz_pos_slider",
+                        "sampler_fz_grain_slider", "sampler_fz_rate_slider",
+                    ):
+                        r = hit.get(dragging_slider)
+                        if r:
+                            from cypher.sampler.sampler import (
+                                P_PITCH, P_GAIN, P_SLICES,
+                                P_FZ_POS, P_FZ_GRAIN, P_FZ_RATE,
+                            )
+                            idx_map = {
+                                "sampler_pitch_slider": P_PITCH,
+                                "sampler_gain_slider": P_GAIN,
+                                "sampler_slices_slider": P_SLICES,
+                                "sampler_fz_pos_slider": P_FZ_POS,
+                                "sampler_fz_grain_slider": P_FZ_GRAIN,
+                                "sampler_fz_rate_slider": P_FZ_RATE,
+                            }
+                            t = max(0.0, min(1.0, (mx_pos - r.x) / max(1, r.width)))
+                            slot_d = player.sampler.slots[
+                                player.sampler.focused_slot_idx]
+                            slot_d.params[idx_map[dragging_slider]].value = t
 
                 elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                     dragging_slider = None
@@ -1778,6 +2672,17 @@ def main():
 
             hit = draw(screen, fonts, player, held_notes, held_chord_key, held_chord_notes)
             player.peak_level *= 0.97
+
+            # Debounced BPM sidecar persist (150ms idle)
+            if player.sampler_bpm_dirty:
+                import time as _tm
+                _now = _tm.monotonic()
+                _done = [si for si, ts in player.sampler_bpm_dirty.items()
+                         if _now - ts >= 0.15]
+                for _si in _done:
+                    player.sampler_persist_slot_meta(_si)
+                    del player.sampler_bpm_dirty[_si]
+
             clock.tick(FPS)
 
     finally:

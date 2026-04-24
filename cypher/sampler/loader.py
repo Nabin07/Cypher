@@ -13,6 +13,8 @@ import numpy as np
 import soundfile as sf
 
 from ..core.types import AudioBuffer, DEFAULT_SAMPLE_RATE
+from .sidecar import read_sidecar, write_sidecar, SampleMeta
+from .tempo import detect_bpm
 
 
 WAV_EXTS = {".wav", ".wave", ".aif", ".aiff", ".flac"}
@@ -142,6 +144,30 @@ def save_file_dialog(
     )
     root.destroy()
     return path or None
+
+
+def load_sample_with_meta(
+    path: str | Path, target_sample_rate: int = DEFAULT_SAMPLE_RATE
+) -> tuple[AudioBuffer, int, SampleMeta]:
+    """Load a sample plus its metadata (BPM, confidence, user_corrected).
+
+    If a sidecar JSON exists next to the sample, use it. Otherwise run
+    tempo detection once and persist the result. Detection is skipped
+    when the sidecar says `user_corrected=True`.
+    """
+    audio, src_sr = load_sample(path, target_sample_rate)
+    existing = read_sidecar(path)
+    if existing is not None and "bpm" in existing:
+        return audio, src_sr, existing
+
+    bpm, conf = detect_bpm(audio, src_sr)
+    meta: SampleMeta = {
+        "bpm": float(bpm),
+        "confidence": float(conf),
+        "user_corrected": False,
+    }
+    write_sidecar(path, meta)
+    return audio, src_sr, meta
 
 
 def format_duration(frames: int, sample_rate: int) -> str:

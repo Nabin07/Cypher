@@ -31,7 +31,7 @@ from ..core.filters import BiquadFilter
 from ..core.parameter import Curve, Parameter
 from ..core.types import AudioBuffer, DEFAULT_SAMPLE_RATE
 from ..core.voice import Voice
-from .pitch_shift import pitch_shift
+from .pitch_shift import pitch_shift, time_stretch
 from .freeze import (
     FreezeState, FreezeProcessor,
     MOTION_HOLD, MOTION_DRIFT, MOTION_OSCILLATE, MOTION_DECAY, MOTION_NAMES,
@@ -101,8 +101,9 @@ class SampleSlot:
 
     __slots__ = (
         "name", "path", "data", "source_rate", "_params", "loaded",
-        "_pitch_cache", "_slice_count_cache", "_slice_points",
-        "freeze_armed",
+        "_pitch_cache", "_match_cache", "_slice_count_cache",
+        "_slice_points", "freeze_armed",
+        "sample_bpm", "bpm_confidence", "user_corrected", "match_mode",
     )
 
     def __init__(self) -> None:
@@ -114,10 +115,17 @@ class SampleSlot:
         self.loaded: bool = False
         # Cache: semitone_int → pitch-shifted buffer (int between -24 and 24)
         self._pitch_cache: dict[int, AudioBuffer] = {}
+        # Cache: (semi_int, project_bpm_int) → matched + pitched buffer
+        self._match_cache: dict[tuple[int, int], AudioBuffer] = {}
         self._slice_count_cache: int = 0
         self._slice_points: list[tuple[int, int]] = []
         # Granular Freeze armed (per-slot flag, not a parameter)
         self.freeze_armed: bool = False
+        # BPM metadata (populated by loader.load_sample_with_meta)
+        self.sample_bpm: float = 0.0
+        self.bpm_confidence: float = 0.0
+        self.user_corrected: bool = False
+        self.match_mode: bool = False
 
     @property
     def params(self) -> list[Parameter]:
@@ -135,15 +143,24 @@ class SampleSlot:
     def length(self) -> int:
         return len(self.data) if self.loaded else 0
 
-    def load(self, name: str, path: str, data: AudioBuffer, source_rate: int) -> None:
+    def load(
+        self, name: str, path: str, data: AudioBuffer, source_rate: int,
+        *, sample_bpm: float = 0.0, bpm_confidence: float = 0.0,
+        user_corrected: bool = False,
+    ) -> None:
         self.name = name
         self.path = path
         self.data = data
         self.source_rate = source_rate
         self.loaded = True
         self._pitch_cache.clear()
+        self._match_cache.clear()
         self._slice_count_cache = 0
         self._slice_points = []
+        self.sample_bpm = float(sample_bpm)
+        self.bpm_confidence = float(bpm_confidence)
+        self.user_corrected = bool(user_corrected)
+        self.match_mode = False
 
     def clear(self) -> None:
         self.name = ""
@@ -151,7 +168,12 @@ class SampleSlot:
         self.data = np.zeros(1, dtype=np.float32)
         self.loaded = False
         self._pitch_cache.clear()
+        self._match_cache.clear()
         self._slice_points = []
+        self.sample_bpm = 0.0
+        self.bpm_confidence = 0.0
+        self.user_corrected = False
+        self.match_mode = False
 
     def get_pitched_buffer(self, semitones: int) -> AudioBuffer:
         """Return the sample pitch-shifted by `semitones` (integer semitones).
@@ -166,6 +188,38 @@ class SampleSlot:
         shifted = pitch_shift(self.data, float(semitones))
         self._pitch_cache[semitones] = shifted
         return shifted
+
+    def get_matched_buffer(
+        self, semitones: int, project_bpm: float
+    ) -> AudioBuffer:
+        """Sample stretched to `project_bpm` and pitched by `semitones`.
+
+        Cached by (semi, int(project_bpm)). Only valid when
+        `sample_bpm > 0`; falls back to `get_pitched_buffer` otherwise.
+        """
+        if not self.loaded:
+            return self.data
+        if self.sample_bpm <= 0.0 or project_bpm <= 0.0:
+            return self.get_pitched_buffer(semitones)
+
+        key = (int(semitones), int(round(project_bpm)))
+        cached = self._match_cache.get(key)
+        if cached is not None:
+            return cached
+
+        # ratio < 1 => faster (shorter). sample=92, project=140 → 0.657 → shorter.
+        ratio = self.sample_bpm / project_bpm
+        stretched = time_stretch(self.data, ratio) if abs(ratio - 1.0) > 1e-3 else self.data
+        if semitones != 0:
+            result = pitch_shift(stretched, float(semitones))
+        else:
+            result = stretched.astype(np.float32, copy=False)
+        self._match_cache[key] = result
+        return result
+
+    def invalidate_bpm_cache(self) -> None:
+        """Drop all Match-mode cached buffers. Call after BPM edit."""
+        self._match_cache.clear()
 
     def refresh_slices(self) -> None:
         """Recompute slice boundaries when SLICES param changes."""
@@ -205,6 +259,8 @@ class SamplerVoice:
 
         # Granular Freeze state. Non-None when voice is in freeze mode.
         self._freeze: FreezeProcessor | None = None
+        # After release, suppress re-engagement on the same trigger.
+        self._freeze_released: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -259,6 +315,8 @@ class SamplerVoice:
         self._amp_env.sustain_level = 1.0
         self._amp_env.release_time = 0.02
         self._amp_env.trigger()
+        # Fresh trigger → freeze can re-engage on this hit
+        self._freeze_released = False
 
         if self._cutoff_hz < 18000.0:
             self._filter.reset()
@@ -269,9 +327,14 @@ class SamplerVoice:
     def release(self, note: int) -> None:
         if note == self._note:
             self._amp_env.release()
-            # Gate mode: freeze ends with note-off.
+            # Gate mode: freeze ends with note-off. Fully discard the
+            # freeze processor AND mark "released" so the voice doesn't
+            # re-engage freeze when the next block's playback path sees
+            # pos >= end (which would loop forever).
             if self._freeze is not None:
                 self._freeze.state.active = False
+                self._freeze = None
+            self._freeze_released = True
 
     def stop(self) -> None:
         self._active = False
@@ -279,6 +342,7 @@ class SamplerVoice:
         self._amp_env._level = 0.0
         self._note = -1
         self._freeze = None
+        self._freeze_released = False
 
     def _engage_freeze(self) -> None:
         """Switch to freeze mode at the end of normal playback."""
@@ -370,7 +434,8 @@ class SamplerVoice:
 
         if hit_end:
             # End of sample/slice — engage freeze if armed, else start release
-            if self.slot is not None and self.slot.freeze_armed:
+            if (self.slot is not None and self.slot.freeze_armed
+                    and not self._freeze_released):
                 self._engage_freeze()
             elif self._amp_env.is_active:
                 self._amp_env.release()
@@ -496,22 +561,54 @@ class SamplerEngine(Voice):
         manual_pitch = slot.params[P_PITCH].mapped
         total_semi = int(round(semi_offset + manual_pitch))
 
+        # Match mode: sample stretched to project BPM (pitch preserved).
+        project_bpm = self.project.bpm if self.project is not None else 0.0
+        use_match = (
+            slot.match_mode and slot.sample_bpm > 0.0 and project_bpm > 0.0
+        )
+
+        def _pick_buffer() -> AudioBuffer | None:
+            if use_match:
+                return slot.get_matched_buffer(total_semi, project_bpm)
+            if total_semi != 0:
+                return slot.get_pitched_buffer(total_semi)
+            return None
+
         existing = self._note_map.get(note)
         voice = existing if existing is not None else self._allocate_voice()
 
-        if mode == MODE_CLASSIC and total_semi != 0:
-            buf = slot.get_pitched_buffer(total_semi)
-            voice.trigger(slot, note, velocity, buffer=buf)
+        if mode == MODE_CLASSIC:
+            buf = _pick_buffer()
+            if buf is not None:
+                voice.trigger(slot, note, velocity, buffer=buf)
+            else:
+                voice.trigger(slot, note, velocity)
         elif mode == MODE_CHOP:
             slot.refresh_slices()
             if slice_idx < 0 or slice_idx >= len(slot._slice_points):
                 return
-            s_start, s_end = slot._slice_points[slice_idx]
-            voice.trigger(slot, note, velocity, slice_start=s_start, slice_end=s_end)
+            # When Match is on, slice points must scale to the stretched buffer.
+            if use_match:
+                buf = slot.get_matched_buffer(total_semi, project_bpm)
+                ratio = len(buf) / max(1, len(slot.data))
+                s_start_raw, s_end_raw = slot._slice_points[slice_idx]
+                s_start = int(s_start_raw * ratio)
+                s_end = int(s_end_raw * ratio)
+                voice.trigger(slot, note, velocity, buffer=buf,
+                              slice_start=s_start, slice_end=s_end)
+            else:
+                s_start, s_end = slot._slice_points[slice_idx]
+                if total_semi != 0:
+                    buf = slot.get_pitched_buffer(total_semi)
+                    voice.trigger(slot, note, velocity, buffer=buf,
+                                  slice_start=s_start, slice_end=s_end)
+                else:
+                    voice.trigger(slot, note, velocity,
+                                  slice_start=s_start, slice_end=s_end)
         else:
-            # PAD mode: optionally apply user PITCH as phase-vocoder shift
-            if total_semi != 0:
-                buf = slot.get_pitched_buffer(total_semi)
+            # PAD mode: Match stretch or pitched buffer (or raw)
+            buf = _pick_buffer()
+            if buf is not None:
                 voice.trigger(slot, note, velocity, buffer=buf)
             else:
                 voice.trigger(slot, note, velocity)
