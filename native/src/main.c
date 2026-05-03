@@ -22,6 +22,8 @@
 #include "kick.h"
 #include "synth.h"
 #include "reverb.h"
+#include "chords.h"
+#include "sampler.h"
 
 /* ── Display ── */
 /* FB is 1080x1920 portrait in memory. We do manual 270-deg rotation:
@@ -45,22 +47,29 @@
 #define COL_SLIDER   0xFF413028
 
 /* ── Engine state ── */
-enum { ENG_808, ENG_KICK, ENG_SYNTH, ENG_COUNT };
-static const char *ENG_NAMES[] = {"808", "KICK", "SYNTH"};
+enum { ENG_808, ENG_KICK, ENG_SYNTH, ENG_SAMPLER, ENG_FX, ENG_CHORD, ENG_COUNT };
+static const char *ENG_NAMES[] = {"808", "KICK", "SYNTH", "SMPLR", "FX", "CHORD"};
 
 typedef struct {
     Sub808 sub808;
     Kick kick;
     PolySynth synth;
+    SamplerEngine sampler;
     Reverb reverb;
 
     int engine_idx;
     int octave;
     int selected_param;
+    int current_page;
     int reverb_on;
     float fx_send[3]; /* send amount per engine */
     int fx_on[3];     /* send on/off per engine */
     float peak;
+
+    /* Chord engine state */
+    int chord_prog_idx;
+    int chord_step;
+    int chord_mode; /* 0=chord, 1=strum dn, 2=strum up, 3=arp */
 
     pthread_mutex_t lock;
     volatile int running;
@@ -231,13 +240,28 @@ static void draw_ui(App *app) {
     int lw = (int)(app->peak * 1200);
     if (lw > 0) fb_rect(app, 220, 124, lw < 1200 ? lw : 1200, 20, lw < 960 ? COL_GREEN : COL_RED);
 
-    /* Parameters */
-    Param *params; int nparam;
+    /* Parameters — paged, 4 per page */
+    Param *all_params = NULL; int total_params = 0;
     switch (app->engine_idx) {
-        case ENG_808:  params = app->sub808.params; nparam = 4; break;
-        case ENG_KICK: params = app->kick.params; nparam = 4; break;
-        case ENG_SYNTH:params = app->synth.params; nparam = 4; break;
-        default: params = NULL; nparam = 0;
+        case ENG_808:  all_params = app->sub808.params; total_params = SUB808_PARAMS; break;
+        case ENG_KICK: all_params = app->kick.params; total_params = KICK_PARAMS; break;
+        case ENG_SYNTH:  all_params = app->synth.params; total_params = SYNTH_PARAMS; break;
+        case ENG_SAMPLER:all_params = app->sampler.slots[app->sampler.focused_slot].params; total_params = SAMPLER_SLOT_PARAMS; break;
+        default: all_params = NULL; total_params = 0;
+    }
+    int num_pages = (total_params + 3) / 4;
+    if (app->current_page >= num_pages) app->current_page = 0;
+    int page_start = app->current_page * 4;
+    int page_end = page_start + 4;
+    if (page_end > total_params) page_end = total_params;
+    Param *params = all_params ? all_params + page_start : NULL;
+    int nparam = page_end - page_start;
+
+    /* Page indicator */
+    if (num_pages > 1) {
+        char pg[32];
+        snprintf(pg, sizeof(pg), "PAGE %d/%d", app->current_page + 1, num_pages);
+        fb_text(app, 1500, 175, pg, COL_TEXT);
     }
 
     fb_rect(app, 60, 170, 1400, 400, COL_PANEL);
@@ -278,7 +302,7 @@ static void draw_ui(App *app) {
 
 /* ── Audio callback ── */
 static void audio_process(App *app, int16_t *out, int frames) {
-    float buf808[BLOCK_SIZE], bufkick[BLOCK_SIZE], bufsynth[BLOCK_SIZE];
+    float buf808[BLOCK_SIZE], bufkick[BLOCK_SIZE], bufsynth[BLOCK_SIZE], bufsampler[BLOCK_SIZE];
     float mix[BLOCK_SIZE], fx_bus[BLOCK_SIZE];
 
     pthread_mutex_lock(&app->lock);
@@ -289,6 +313,10 @@ static void audio_process(App *app, int16_t *out, int frames) {
     sub808_process(&app->sub808, buf808, frames);
     kick_process(&app->kick, bufkick, frames);
     polysynth_process(&app->synth, bufsynth, frames);
+    sampler_process(&app->sampler, bufsampler, frames);
+
+    /* Mix sampler directly (no FX send for now) */
+    for (int i = 0; i < frames; i++) mix[i] += bufsampler[i];
 
     float *bufs[] = {buf808, bufkick, bufsynth};
     for (int e = 0; e < 3; e++) {
@@ -387,22 +415,22 @@ static void *touch_thread(void *arg) {
                 app->touch_y = ev.value;
         }
         if (ev.type == EV_SYN && app->touch_down) {
-            /* Continuous drag update for sliders */
             int sx = (1280 - app->touch_y) * SCREEN_W / 1280;
-            int sy = app->touch_x * SCREEN_H / 720 - 150;
+            int sy = app->touch_x * SCREEN_H / 720 - 80;
             if (sy >= 170 && sy < 550 && sx >= 650 && sx <= 1400) {
                 int pi = (sy - 190) / 90;
                 if (pi >= 0 && pi < 4) {
                     float t = clampf((float)(sx - 650) / 750.0f, 0, 1);
-                    Param *params = NULL;
+                    Param *ap = NULL; int tp = 0;
                     switch (app->engine_idx) {
-                        case ENG_808:  params = app->sub808.params; break;
-                        case ENG_KICK: params = app->kick.params; break;
-                        case ENG_SYNTH:params = app->synth.params; break;
+                        case ENG_808:  ap = app->sub808.params; tp = SUB808_PARAMS; break;
+                        case ENG_KICK: ap = app->kick.params; tp = KICK_PARAMS; break;
+                        case ENG_SYNTH:ap = app->synth.params; tp = SYNTH_PARAMS; break;
                     }
-                    if (params) {
+                    int abs_idx = app->current_page * 4 + pi;
+                    if (ap && abs_idx < tp) {
                         pthread_mutex_lock(&app->lock);
-                        params[pi].value = t;
+                        ap[abs_idx].value = t;
                         pthread_mutex_unlock(&app->lock);
                     }
                 }
@@ -438,32 +466,46 @@ static void *touch_thread(void *arg) {
                         switch (app->engine_idx) {
                             case ENG_808:  sub808_trigger(&app->sub808, note, 0.9f); break;
                             case ENG_KICK: kick_trigger(&app->kick, note, 0.9f); break;
-                            case ENG_SYNTH: polysynth_trigger(&app->synth, note, 0.9f); break;
+                            case ENG_SYNTH:   polysynth_trigger(&app->synth, note, 0.9f); break;
+                            case ENG_SAMPLER: sampler_trigger(&app->sampler, note, 0.9f); break;
                         }
                         pthread_mutex_unlock(&app->lock);
                     }
                 }
 
-                /* Slider touch */
+                /* Slider touch — paged */
                 if (sy >= 170 && sy < 550 && sx >= 650 && sx <= 1400) {
                     int pi = (sy - 190) / 90;
                     if (pi >= 0 && pi < 4) {
-                        float t = (float)(sx - 650) / 750.0f;
-                        t = clampf(t, 0, 1);
+                        float t = clampf((float)(sx - 650) / 750.0f, 0, 1);
                         app->selected_param = pi;
-                        Param *params;
+                        Param *ap = NULL; int tp = 0;
                         switch (app->engine_idx) {
-                            case ENG_808:  params = app->sub808.params; break;
-                            case ENG_KICK: params = app->kick.params; break;
-                            case ENG_SYNTH:params = app->synth.params; break;
-                            default: params = NULL;
+                            case ENG_808:  ap = app->sub808.params; tp = SUB808_PARAMS; break;
+                            case ENG_KICK: ap = app->kick.params; tp = KICK_PARAMS; break;
+                            case ENG_SYNTH:  ap = app->synth.params; tp = SYNTH_PARAMS; break;
+                            case ENG_SAMPLER:ap = app->sampler.slots[app->sampler.focused_slot].params; tp = SAMPLER_SLOT_PARAMS; break;
                         }
-                        if (params) {
+                        int abs_idx = app->current_page * 4 + pi;
+                        if (ap && abs_idx < tp) {
                             pthread_mutex_lock(&app->lock);
-                            params[pi].value = t;
+                            ap[abs_idx].value = t;
                             pthread_mutex_unlock(&app->lock);
                         }
                     }
+                }
+
+                /* Page tap (top-right area near PAGE text) */
+                if (!debounced && sx >= 1450 && sx <= 1850 && sy >= 155 && sy <= 195) {
+                    int tp = 0;
+                    switch (app->engine_idx) {
+                        case ENG_808:    tp = SUB808_PARAMS; break;
+                        case ENG_KICK:   tp = KICK_PARAMS; break;
+                        case ENG_SYNTH:  tp = SYNTH_PARAMS; break;
+                        case ENG_SAMPLER:tp = SAMPLER_SLOT_PARAMS; break;
+                    }
+                    int np = (tp + 3) / 4;
+                    if (np > 0) app->current_page = (app->current_page + 1) % np;
                 }
 
                 /* Reverb toggle (debounced) */
@@ -547,7 +589,8 @@ static void *midi_thread(void *arg) {
                 switch (app->engine_idx) {
                     case ENG_808:  sub808_release(&app->sub808, note); break;
                     case ENG_KICK: kick_release(&app->kick, note); break;
-                    case ENG_SYNTH: polysynth_release(&app->synth, note); break;
+                    case ENG_SYNTH:   polysynth_release(&app->synth, note); break;
+                    case ENG_SAMPLER: sampler_release(&app->sampler, note); break;
                 }
                 pthread_mutex_unlock(&app->lock);
             }
@@ -577,7 +620,18 @@ int main(void) {
     sub808_init(&app.sub808);
     kick_init(&app.kick);
     polysynth_init(&app.synth);
+    sampler_init(&app.sampler, SR);
     reverb_init(&app.reverb);
+
+    /* Load any samples in /opt/cypher/samples/ */
+    {
+        char path[256];
+        for (int i = 0; i < 16; i++) {
+            snprintf(path, sizeof(path), "/opt/cypher/samples/pad%02d.wav", i);
+            FILE *test = fopen(path, "r");
+            if (test) { fclose(test); sampler_load_slot(&app.sampler, i, path); }
+        }
+    }
     app.reverb_on = 0;
     app.fx_on[2] = 1; /* synth send on by default */
     app.fx_send[0] = 0.5f; app.fx_send[1] = 0.5f; app.fx_send[2] = 0.5f;
