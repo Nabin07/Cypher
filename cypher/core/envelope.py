@@ -30,11 +30,9 @@ class ADEnvelope:
         self._position: int = 0   # sample position within current stage
         self._level: float = 0.0  # current envelope level
         self._release_level: float = 0.0
-        self._retrigger_level: float = 0.0  # for soft retrigger (anti-pop)
 
     def trigger(self) -> None:
-        """Start the envelope — soft retrigger from current level to avoid pops."""
-        self._retrigger_level = self._level  # remember where we are
+        """Start the envelope from the beginning."""
         self._stage = "attack"
         self._position = 0
 
@@ -66,9 +64,7 @@ class ADEnvelope:
 
                 t = (np.arange(self._position, self._position + n, dtype=np.float32)
                      / attack_samples)
-                # Ramp from retrigger level to 1.0 (soft retrigger)
-                base = self._retrigger_level
-                output[i:i + n] = base + (1.0 - base) * t
+                output[i:i + n] = t
                 self._position += n
                 self._level = output[i + n - 1] if n > 0 else self._level
                 i += n
@@ -193,10 +189,8 @@ class TrapEnvelope:
         self._position: int = 0
         self._level: float = 0.0
         self._release_level: float = 0.0
-        self._retrigger_level: float = 0.0
 
     def trigger(self) -> None:
-        self._retrigger_level = self._level
         self._stage = "attack"
         self._position = 0
 
@@ -222,8 +216,7 @@ class TrapEnvelope:
 
                 t = (np.arange(self._position, self._position + n, dtype=np.float32)
                      / attack_samples)
-                base = self._retrigger_level
-                output[i:i + n] = base + (1.0 - base) * t
+                output[i:i + n] = t
                 self._position += n
                 self._level = float(output[i + n - 1]) if n > 0 else self._level
                 i += n

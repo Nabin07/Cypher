@@ -240,64 +240,185 @@ static void draw_ui(App *app) {
     int lw = (int)(app->peak * 1200);
     if (lw > 0) fb_rect(app, 220, 124, lw < 1200 ? lw : 1200, 20, lw < 960 ? COL_GREEN : COL_RED);
 
-    /* Parameters — paged, 4 per page */
-    Param *all_params = NULL; int total_params = 0;
-    switch (app->engine_idx) {
-        case ENG_808:  all_params = app->sub808.params; total_params = SUB808_PARAMS; break;
-        case ENG_KICK: all_params = app->kick.params; total_params = KICK_PARAMS; break;
-        case ENG_SYNTH:  all_params = app->synth.params; total_params = SYNTH_PARAMS; break;
-        case ENG_SAMPLER:all_params = app->sampler.slots[app->sampler.focused_slot].params; total_params = SAMPLER_SLOT_PARAMS; break;
-        default: all_params = NULL; total_params = 0;
+    /* ── SAMPLER tab ── */
+    if (app->engine_idx == ENG_SAMPLER) {
+        /* 4x4 pad grid */
+        int pad_w = 100, pad_h = 80, pad_x0 = 80, pad_y0 = 170;
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                int idx = r * 4 + c;
+                int px = pad_x0 + c * (pad_w + 10);
+                int py = pad_y0 + r * (pad_h + 10);
+                SampleSlot *sl = &app->sampler.slots[idx];
+                int focused = idx == app->sampler.focused_slot;
+                uint32_t bg = sl->loaded ? (focused ? 0xFF60B880 : 0xFF408260) : (focused ? 0xFF505070 : COL_PANEL);
+                fb_rect(app, px, py, pad_w, pad_h, bg);
+                char num[4]; snprintf(num, sizeof(num), "%d", idx + 1);
+                fb_text(app, px + 8, py + 8, num, COL_TEXT);
+                if (sl->loaded) {
+                    char nm[12];
+                    strncpy(nm, sl->name, 8); nm[8] = 0;
+                    fb_text(app, px + 8, py + 40, nm, 0xFFE0E0F0);
+                }
+            }
+        }
+
+        /* Focused slot params (right side) */
+        SampleSlot *fsl = &app->sampler.slots[app->sampler.focused_slot];
+        int num_pages = (SAMPLER_SLOT_PARAMS + 3) / 4;
+        if (app->current_page >= num_pages) app->current_page = 0;
+        int ps = app->current_page * 4;
+        int pe = ps + 4; if (pe > SAMPLER_SLOT_PARAMS) pe = SAMPLER_SLOT_PARAMS;
+
+        char pg[32]; snprintf(pg, sizeof(pg), "PAD %d  PAGE %d/%d", app->sampler.focused_slot + 1, app->current_page + 1, num_pages);
+        fb_text(app, 560, 170, pg, COL_CYAN);
+
+        fb_rect(app, 540, 200, 900, 360, COL_PANEL);
+        for (int i = 0; i < pe - ps; i++) {
+            int py = 220 + i * 80;
+            Param *p = &fsl->params[ps + i];
+            uint32_t col = (i == app->selected_param) ? COL_YELLOW : COL_TEXT;
+            fb_text(app, 560, py, p->label, col);
+            char val[32]; float m = param_mapped(p);
+            if (strcmp(p->unit, "Hz") == 0) snprintf(val, sizeof(val), "%.0fHZ", m);
+            else if (strcmp(p->unit, "ms") == 0) snprintf(val, sizeof(val), "%.0fMS", m);
+            else if (strcmp(p->unit, "st") == 0) snprintf(val, sizeof(val), "%.1fST", m);
+            else snprintf(val, sizeof(val), "%.2f", p->value);
+            fb_text(app, 800, py, val, col);
+            fb_rect(app, 1000, py + 4, 400, 16, COL_SLIDER);
+            int sw = (int)(p->value * 400);
+            if (sw > 0) fb_rect(app, 1000, py + 4, sw, 16, i == app->selected_param ? COL_GREEN : COL_DIM);
+        }
+
+        /* Info */
+        int loaded_count = 0, active_count = 0;
+        for (int i = 0; i < 16; i++) if (app->sampler.slots[i].loaded) loaded_count++;
+        for (int i = 0; i < 8; i++) if (app->sampler.voices[i].active) active_count++;
+        char info[64];
+        snprintf(info, sizeof(info), "SLOTS: %d/16  VOICES: %d/8", loaded_count, active_count);
+        fb_text(app, 80, SCREEN_H - 80, info, COL_DIM);
+        fb_text(app, 80, SCREEN_H - 40, "LOAD: /OPT/CYPHER/SAMPLES/PAD00.WAV", COL_DIM);
     }
-    int num_pages = (total_params + 3) / 4;
-    if (app->current_page >= num_pages) app->current_page = 0;
-    int page_start = app->current_page * 4;
-    int page_end = page_start + 4;
-    if (page_end > total_params) page_end = total_params;
-    Param *params = all_params ? all_params + page_start : NULL;
-    int nparam = page_end - page_start;
 
-    /* Page indicator */
-    if (num_pages > 1) {
-        char pg[32];
-        snprintf(pg, sizeof(pg), "PAGE %d/%d", app->current_page + 1, num_pages);
-        fb_text(app, 1500, 175, pg, COL_TEXT);
+    /* ── CHORD tab ── */
+    else if (app->engine_idx == ENG_CHORD) {
+        fb_text(app, 80, 170, "PROGRESSION", COL_TEXT);
+        /* Progression list */
+        fb_rect(app, 60, 200, 900, 300, COL_PANEL);
+        for (int i = 0; i < NUM_PROGRESSIONS; i++) {
+            int py = 210 + i * 48;
+            int sel = i == app->chord_prog_idx;
+            uint32_t col = sel ? COL_CYAN : COL_DIM;
+            if (sel) fb_rect(app, 70, py, 880, 40, 0xFF2D2D50);
+            char row[128];
+            /* Build chord labels */
+            int root = app->octave * 12 + 24;
+            int notes[5]; char lbl[16];
+            char labels[64] = "";
+            for (int s = 0; s < prog_length(i); s++) {
+                build_prog_chord(root, i, s, notes, lbl, sizeof(lbl));
+                if (s > 0) strcat(labels, " - ");
+                strcat(labels, lbl);
+            }
+            snprintf(row, sizeof(row), "%s%s  %s", sel ? "> " : "  ", PROGRESSIONS[i].name, labels);
+            fb_text(app, 80, py + 8, row, col);
+        }
+
+        /* Steps */
+        fb_text(app, 1000, 200, "STEPS", COL_TEXT);
+        int root = app->octave * 12 + 24;
+        int plen = prog_length(app->chord_prog_idx);
+        for (int si = 0; si < plen; si++) {
+            int notes[5]; char lbl[16];
+            build_prog_chord(root, app->chord_prog_idx, si, notes, lbl, sizeof(lbl));
+            uint32_t col = (si == app->chord_step) ? COL_CYAN : COL_DIM;
+            char step[24]; snprintf(step, sizeof(step), "[%s]", lbl);
+            fb_text(app, 1000, 240 + si * 50, step, col);
+        }
+
+        /* Mode */
+        const char *modes[] = {"CHORD", "STRUM DN", "STRUM UP", "ARP"};
+        fb_text(app, 1000, 460, "MODE", COL_TEXT);
+        for (int i = 0; i < 4; i++) {
+            uint32_t col = (i == app->chord_mode) ? COL_GREEN : COL_DIM;
+            fb_text(app, 1000, 500 + i * 40, modes[i], col);
+        }
     }
 
-    fb_rect(app, 60, 170, 1400, 400, COL_PANEL);
-    for (int i = 0; i < nparam && i < 4; i++) {
-        int py = 190 + i * 90;
-        uint32_t col = (i == app->selected_param) ? COL_YELLOW : COL_TEXT;
-        char label[32], val[32];
-        snprintf(label, sizeof(label), "%s%s", i == app->selected_param ? "> " : "  ", params[i].label);
-        fb_text(app, 80, py, label, col);
+    /* ── FX tab ── */
+    else if (app->engine_idx == ENG_FX) {
+        fb_text(app, 80, 170, "REVERB", COL_TEXT);
+        fb_text(app, 300, 170, app->reverb_on ? "[ON]" : "[OFF]", app->reverb_on ? COL_GREEN : COL_RED);
 
-        float m = param_mapped(&params[i]);
-        if (strcmp(params[i].unit, "Hz") == 0) snprintf(val, sizeof(val), "%.0fHZ", m);
-        else if (strcmp(params[i].unit, "s") == 0) snprintf(val, sizeof(val), "%.2fS", m);
-        else snprintf(val, sizeof(val), "%.2f", params[i].value);
-        fb_text(app, 400, py, val, col);
+        /* FX send per engine */
+        fb_text(app, 80, 220, "SENDS:", COL_TEXT);
+        const char *eng_names[] = {"808", "KICK", "SYNTH"};
+        for (int i = 0; i < 3; i++) {
+            int sy = 260 + i * 50;
+            fb_text(app, 80, sy, eng_names[i], COL_TEXT);
+            fb_text(app, 250, sy, app->fx_on[i] ? "ON" : "OFF", app->fx_on[i] ? COL_GREEN : COL_DIM);
+            fb_rect(app, 400, sy + 4, 400, 16, COL_SLIDER);
+            int sw = (int)(app->fx_send[i] * 400);
+            if (sw > 0) fb_rect(app, 400, sy + 4, sw, 16, COL_GREEN);
+            char pct[16]; snprintf(pct, sizeof(pct), "%d%%", (int)(app->fx_send[i] * 100));
+            fb_text(app, 820, sy, pct, COL_TEXT);
+        }
 
-        /* Slider */
-        fb_rect(app, 650, py + 4, 750, 16, COL_SLIDER);
-        int sw = (int)(params[i].value * 750);
-        if (sw > 0) fb_rect(app, 650, py + 4, sw, 16, i == app->selected_param ? COL_GREEN : COL_DIM);
+        fb_text(app, 80, 440, "REVERB MODE:", COL_TEXT);
+        const char *rev_modes[] = {"ROOM", "CHAMBER", "HALL", "PLATE"};
+        for (int i = 0; i < 4; i++) {
+            uint32_t col = (i == app->reverb.mode) ? COL_GREEN : COL_DIM;
+            fb_text(app, 80 + i * 200, 480, rev_modes[i], col);
+        }
     }
 
-    /* Reverb status */
-    fb_text(app, 1500, 190, app->reverb_on ? "[REVERB ON]" : "[REVERB]",
-            app->reverb_on ? COL_GREEN : COL_DIM);
+    /* ── Normal engine UI (808/KICK/SYNTH) ── */
+    else {
+        Param *all_params = NULL; int total_params = 0;
+        switch (app->engine_idx) {
+            case ENG_808:  all_params = app->sub808.params; total_params = SUB808_PARAMS; break;
+            case ENG_KICK: all_params = app->kick.params; total_params = KICK_PARAMS; break;
+            case ENG_SYNTH:all_params = app->synth.params; total_params = SYNTH_PARAMS; break;
+        }
+        int num_pages = total_params > 0 ? (total_params + 3) / 4 : 0;
+        if (app->current_page >= num_pages) app->current_page = 0;
+        int ps = app->current_page * 4;
+        int pe = ps + 4; if (pe > total_params) pe = total_params;
 
-    /* Octave */
-    char oct[16];
-    snprintf(oct, sizeof(oct), "OCT: C%d", app->octave);
-    fb_text(app, 1500, 240, oct, COL_TEXT);
+        if (num_pages > 1) {
+            char pg[32]; snprintf(pg, sizeof(pg), "PAGE %d/%d", app->current_page + 1, num_pages);
+            fb_text(app, 1500, 175, pg, COL_TEXT);
+        }
 
-    /* Keyboard */
+        fb_rect(app, 60, 170, 1400, 400, COL_PANEL);
+        for (int i = 0; i < pe - ps; i++) {
+            int py = 190 + i * 90;
+            Param *p = &all_params[ps + i];
+            uint32_t col = (i == app->selected_param) ? COL_YELLOW : COL_TEXT;
+            char label[32], val[32];
+            snprintf(label, sizeof(label), "%s%s", i == app->selected_param ? "> " : "  ", p->label);
+            fb_text(app, 80, py, label, col);
+            float m = param_mapped(p);
+            if (strcmp(p->unit, "Hz") == 0) snprintf(val, sizeof(val), "%.0fHZ", m);
+            else if (strcmp(p->unit, "s") == 0) snprintf(val, sizeof(val), "%.2fS", m);
+            else snprintf(val, sizeof(val), "%.2f", p->value);
+            fb_text(app, 400, py, val, col);
+            fb_rect(app, 650, py + 4, 750, 16, COL_SLIDER);
+            int sw = (int)(p->value * 750);
+            if (sw > 0) fb_rect(app, 650, py + 4, sw, 16, i == app->selected_param ? COL_GREEN : COL_DIM);
+        }
+
+        fb_text(app, 1500, 190, app->reverb_on ? "[REVERB ON]" : "[REVERB]",
+                app->reverb_on ? COL_GREEN : COL_DIM);
+        char oct[16]; snprintf(oct, sizeof(oct), "OCT: C%d", app->octave);
+        fb_text(app, 1500, 240, oct, COL_TEXT);
+    }
+
+    /* Keyboard (always visible) */
     draw_keyboard(app, SCREEN_H - 200 - 120);
 
     /* Help */
-    fb_text(app, 80, SCREEN_H - 20, "TAP KEYS TO PLAY  SWIPE SLIDERS  TAP TABS TO SWITCH", COL_DIM);
+    fb_text(app, 80, SCREEN_H - 20, "MIDI  TOUCH TABS  SWIPE SLIDERS  TAP PAGE", COL_DIM);
 }
 
 /* ── Audio callback ── */
@@ -363,7 +484,7 @@ static void *audio_thread(void *arg) {
     snd_pcm_t *pcm;
     int err;
 
-    if ((err = snd_pcm_open(&pcm, "hw:0,0", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+    if ((err = snd_pcm_open(&pcm, "hw:1,0", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
         fprintf(stderr, "ALSA open: %s\n", snd_strerror(err));
         return NULL;
     }
@@ -513,11 +634,45 @@ static void *touch_thread(void *arg) {
                     app->reverb_on = !app->reverb_on;
                     if (!app->reverb_on) reverb_clear(&app->reverb);
                 }
+
+                /* CHORD tab touch */
+                if (!debounced && app->engine_idx == ENG_CHORD) {
+                    /* Progression selection (left panel, y=200..500) */
+                    if (sx >= 60 && sx <= 960 && sy >= 200 && sy <= 500) {
+                        int pi = (sy - 210) / 48;
+                        if (pi >= 0 && pi < NUM_PROGRESSIONS) {
+                            app->chord_prog_idx = pi;
+                            app->chord_step = 0;
+                        }
+                    }
+                    /* Step selection (right side, y=240..440) */
+                    if (sx >= 1000 && sx <= 1400 && sy >= 240 && sy <= 440) {
+                        int si = (sy - 240) / 50;
+                        int plen = prog_length(app->chord_prog_idx);
+                        if (si >= 0 && si < plen) {
+                            app->chord_step = si;
+                            /* Trigger the chord */
+                            int root = app->octave * 12 + 24;
+                            int notes[5]; char lbl[16];
+                            int count = build_prog_chord(root, app->chord_prog_idx, si, notes, lbl, sizeof(lbl));
+                            pthread_mutex_lock(&app->lock);
+                            polysynth_release_all(&app->synth);
+                            for (int n = 0; n < count; n++)
+                                polysynth_trigger(&app->synth, notes[n], 0.8f);
+                            pthread_mutex_unlock(&app->lock);
+                        }
+                    }
+                    /* Mode selection (y=500..660) */
+                    if (sx >= 1000 && sx <= 1400 && sy >= 500 && sy <= 660) {
+                        int mi = (sy - 500) / 40;
+                        if (mi >= 0 && mi < 4) app->chord_mode = mi;
+                    }
+                }
             }
             if (ev.value == 0) {
                 app->touch_down = 0;
-                /* Release notes on synth */
-                if (app->engine_idx == ENG_SYNTH) {
+                /* Release notes on synth/chord */
+                if (app->engine_idx == ENG_SYNTH || app->engine_idx == ENG_CHORD) {
                     pthread_mutex_lock(&app->lock);
                     polysynth_release_all(&app->synth);
                     pthread_mutex_unlock(&app->lock);
@@ -533,10 +688,12 @@ static void *touch_thread(void *arg) {
 /* ── MIDI thread ── */
 static void *midi_thread(void *arg) {
     App *app = (App *)arg;
-    app->midi_fd = open("/dev/midi2", O_RDONLY);
+    app->midi_fd = open("/dev/midi", O_RDONLY);
     if (app->midi_fd < 0) {
-        /* Try alternative */
-        app->midi_fd = open("/dev/snd/midiC2D0", O_RDONLY);
+        app->midi_fd = open("/dev/midi2", O_RDONLY);
+    }
+    if (app->midi_fd < 0) {
+        app->midi_fd = open("/dev/snd/midiC0D0", O_RDONLY);
     }
     if (app->midi_fd < 0) {
         fprintf(stderr, "MIDI: no device found\n");
@@ -575,10 +732,25 @@ static void *midi_thread(void *arg) {
                 app->active_notes[note] = 1;
                 float fvel = vel / 127.0f;
                 pthread_mutex_lock(&app->lock);
-                switch (app->engine_idx) {
-                    case ENG_808:  sub808_trigger(&app->sub808, note, fvel); break;
-                    case ENG_KICK: kick_trigger(&app->kick, note, fvel); break;
-                    case ENG_SYNTH: polysynth_trigger(&app->synth, note, fvel); break;
+                if (app->engine_idx == ENG_CHORD) {
+                    /* The played note IS the key root — build the chord
+                       for the current step around it */
+                    int cnotes[5]; char clbl[16];
+                    int cnt = build_prog_chord(note, app->chord_prog_idx,
+                                               app->chord_step, cnotes, clbl, sizeof(clbl));
+                    polysynth_release_all(&app->synth);
+                    for (int cn = 0; cn < cnt; cn++)
+                        polysynth_trigger(&app->synth, cnotes[cn], fvel);
+                    /* Show which notes are active */
+                    for (int cn = 0; cn < cnt; cn++)
+                        if (cnotes[cn] < 128) app->active_notes[cnotes[cn]] = 1;
+                } else {
+                    switch (app->engine_idx) {
+                        case ENG_808:  sub808_trigger(&app->sub808, note, fvel); break;
+                        case ENG_KICK: kick_trigger(&app->kick, note, fvel); break;
+                        case ENG_SYNTH:   polysynth_trigger(&app->synth, note, fvel); break;
+                            case ENG_SAMPLER: sampler_trigger(&app->sampler, note, fvel); break;
+                    }
                 }
                 pthread_mutex_unlock(&app->lock);
             }
@@ -591,6 +763,10 @@ static void *midi_thread(void *arg) {
                     case ENG_KICK: kick_release(&app->kick, note); break;
                     case ENG_SYNTH:   polysynth_release(&app->synth, note); break;
                     case ENG_SAMPLER: sampler_release(&app->sampler, note); break;
+                    case ENG_CHORD:
+                        polysynth_release_all(&app->synth);
+                        memset(app->active_notes, 0, sizeof(app->active_notes));
+                        break;
                 }
                 pthread_mutex_unlock(&app->lock);
             }

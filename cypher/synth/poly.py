@@ -155,14 +155,15 @@ class PolySynthVoice(Voice):
             if not v.is_active:
                 return v
 
-        # All busy — steal oldest (soft release to avoid pop)
+        # All busy — steal oldest
         if self._alloc_order:
             stolen = self._alloc_order.pop(0)
+            # Clean up note map
             for note, voice in list(self._note_map.items()):
                 if voice is stolen:
-                    stolen.release(note)
                     del self._note_map[note]
                     break
+            stolen.all_notes_off()
             return stolen
 
         # Fallback (shouldn't happen)
