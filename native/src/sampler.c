@@ -54,13 +54,16 @@ static float *slot_get_pitched(SampleSlot *s, int semitones) {
 static void slot_refresh_slices(SampleSlot *s) {
     int n = (int)roundf(param_mapped(&s->params[SP_SLICES]));
     if (n < 1) n = 1; if (n > 32) n = 32;
-    if (n == s->slice_count || !s->loaded) return;
+    if (!s->loaded) return;
+    /* Keep manual edits as long as the count param hasn't changed. */
+    if (n == s->slice_count) return;
     int slice_w = s->length / n;
     for (int i = 0; i < n; i++) {
         s->slice_starts[i] = i * slice_w;
         s->slice_ends[i] = (i < n - 1) ? (i + 1) * slice_w : s->length;
     }
     s->slice_count = n;
+    s->slice_manual = 0;
 }
 
 static int slot_mode(SampleSlot *s) {
@@ -341,4 +344,36 @@ int sampler_active(SamplerEngine *s) {
     for (int i = 0; i < SAMPLER_VOICE_COUNT; i++)
         if (s->voices[i].active) return 1;
     return 0;
+}
+
+void sampler_ensure_slices(SamplerEngine *s, int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= SAMPLER_PAD_COUNT) return;
+    slot_refresh_slices(&s->slots[slot_idx]);
+}
+
+void sampler_set_slice(SamplerEngine *s, int slot_idx, int slice_idx,
+                       float start_frac, float end_frac) {
+    if (slot_idx < 0 || slot_idx >= SAMPLER_PAD_COUNT) return;
+    SampleSlot *sl = &s->slots[slot_idx];
+    if (!sl->loaded || sl->length <= 0) return;
+    if (slice_idx < 0 || slice_idx >= sl->slice_count) return;
+    if (start_frac < 0) start_frac = 0; if (start_frac > 1) start_frac = 1;
+    if (end_frac   < 0) end_frac   = 0; if (end_frac   > 1) end_frac   = 1;
+    int st = (int)(start_frac * sl->length);
+    int en = (int)(end_frac   * sl->length);
+    if (en <= st) en = st + 1;
+    if (en > sl->length) en = sl->length;
+    if (st >= en) st = en - 1;
+    if (st < 0) st = 0;
+    sl->slice_starts[slice_idx] = st;
+    sl->slice_ends[slice_idx]   = en;
+    sl->slice_manual = 1;
+}
+
+void sampler_reset_slices(SamplerEngine *s, int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= SAMPLER_PAD_COUNT) return;
+    SampleSlot *sl = &s->slots[slot_idx];
+    sl->slice_count = 0;
+    sl->slice_manual = 0;
+    slot_refresh_slices(sl);
 }

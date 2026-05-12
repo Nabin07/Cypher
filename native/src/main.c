@@ -71,6 +71,9 @@ typedef struct {
     int chord_step;
     int chord_mode; /* 0=chord, 1=strum dn, 2=strum up, 3=arp */
 
+    /* Sampler edit state */
+    int selected_slice;
+
     pthread_mutex_t lock;
     volatile int running;
 
@@ -242,6 +245,12 @@ static void draw_ui(App *app) {
 
     /* ── SAMPLER tab ── */
     if (app->engine_idx == ENG_SAMPLER) {
+        SampleSlot *fsl = &app->sampler.slots[app->sampler.focused_slot];
+        sampler_ensure_slices(&app->sampler, app->sampler.focused_slot);
+        if (app->selected_slice < 0 ||
+            (fsl->slice_count > 0 && app->selected_slice >= fsl->slice_count))
+            app->selected_slice = 0;
+
         /* 4x4 pad grid */
         int pad_w = 100, pad_h = 80, pad_x0 = 80, pad_y0 = 170;
         for (int r = 0; r < 4; r++) {
@@ -264,7 +273,6 @@ static void draw_ui(App *app) {
         }
 
         /* Focused slot params (right side) */
-        SampleSlot *fsl = &app->sampler.slots[app->sampler.focused_slot];
         int num_pages = (SAMPLER_SLOT_PARAMS + 3) / 4;
         if (app->current_page >= num_pages) app->current_page = 0;
         int ps = app->current_page * 4;
@@ -290,6 +298,56 @@ static void draw_ui(App *app) {
             if (sw > 0) fb_rect(app, 1000, py + 4, sw, 16, i == app->selected_param ? COL_GREEN : COL_DIM);
         }
 
+        /* ── Slice editor ── */
+        int strip_x = 80, strip_y = 605, strip_w = 1360, strip_h = 70;
+        char shdr[64];
+        snprintf(shdr, sizeof(shdr), "SLICES %d/%d%s",
+                 fsl->slice_count > 0 ? app->selected_slice + 1 : 0,
+                 fsl->slice_count,
+                 fsl->slice_manual ? "  EDITED" : "");
+        fb_text(app, strip_x, 575, shdr, COL_CYAN);
+        fb_text(app, 700, 575, "[PREV]", COL_DIM);
+        fb_text(app, 830, 575, "[NEXT]", COL_DIM);
+        fb_text(app, 960, 575, "[RESET]", COL_DIM);
+
+        fb_rect(app, strip_x, strip_y, strip_w, strip_h, 0xFF101018);
+        if (fsl->loaded && fsl->length > 0 && fsl->slice_count > 0) {
+            for (int i = 0; i < fsl->slice_count; i++) {
+                int sx0 = strip_x + (int)((float)fsl->slice_starts[i] / fsl->length * strip_w);
+                int sx1 = strip_x + (int)((float)fsl->slice_ends[i]   / fsl->length * strip_w);
+                int sw = sx1 - sx0; if (sw < 1) sw = 1;
+                int sel = i == app->selected_slice;
+                uint32_t fill = sel ? 0xFF285028 : ((i & 1) ? 0xFF1A1A28 : 0xFF22222F);
+                fb_rect(app, sx0, strip_y, sw, strip_h, fill);
+                fb_rect(app, sx0, strip_y, 2, strip_h, sel ? 0xFF80FF80 : 0xFF505070);
+                /* Slice number */
+                if (sw > 24) {
+                    char num[4]; snprintf(num, sizeof(num), "%d", i + 1);
+                    fb_text(app, sx0 + 6, strip_y + 6, num, sel ? COL_GREEN : COL_DIM);
+                }
+            }
+            int lastEnd = fsl->slice_ends[fsl->slice_count - 1];
+            int sx_end = strip_x + (int)((float)lastEnd / fsl->length * strip_w);
+            if (sx_end > strip_x + strip_w - 2) sx_end = strip_x + strip_w - 2;
+            fb_rect(app, sx_end, strip_y, 2, strip_h, 0xFF505070);
+        } else {
+            fb_text(app, strip_x + 12, strip_y + 28, "LOAD SAMPLE TO EDIT SLICES", COL_DIM);
+        }
+
+        /* Start / End sliders for selected slice */
+        if (fsl->loaded && fsl->slice_count > 0) {
+            float sf = (float)fsl->slice_starts[app->selected_slice] / fsl->length;
+            float ef = (float)fsl->slice_ends[app->selected_slice]   / fsl->length;
+            char sl[24]; snprintf(sl, sizeof(sl), "START %4.1f%%", sf * 100);
+            char el[24]; snprintf(el, sizeof(el), "END   %4.1f%%", ef * 100);
+            fb_text(app, 80, 700, sl, COL_TEXT);
+            fb_rect(app, 320, 705, 380, 18, COL_SLIDER);
+            fb_rect(app, 320, 705, (int)(sf * 380), 18, COL_GREEN);
+            fb_text(app, 760, 700, el, COL_TEXT);
+            fb_rect(app, 1000, 705, 380, 18, COL_SLIDER);
+            fb_rect(app, 1000, 705, (int)(ef * 380), 18, COL_GREEN);
+        }
+
         /* Info */
         int loaded_count = 0, active_count = 0;
         for (int i = 0; i < 16; i++) if (app->sampler.slots[i].loaded) loaded_count++;
@@ -297,7 +355,6 @@ static void draw_ui(App *app) {
         char info[64];
         snprintf(info, sizeof(info), "SLOTS: %d/16  VOICES: %d/8", loaded_count, active_count);
         fb_text(app, 80, SCREEN_H - 80, info, COL_DIM);
-        fb_text(app, 80, SCREEN_H - 40, "LOAD: /OPT/CYPHER/SAMPLES/PAD00.WAV", COL_DIM);
     }
 
     /* ── CHORD tab ── */
@@ -556,6 +613,29 @@ static void *touch_thread(void *arg) {
                     }
                 }
             }
+            /* Slice start/end slider drag (sampler tab) */
+            if (app->engine_idx == ENG_SAMPLER && sy >= 700 && sy <= 730) {
+                SampleSlot *fsl = &app->sampler.slots[app->sampler.focused_slot];
+                if (fsl->loaded && fsl->slice_count > 0) {
+                    float sf = (float)fsl->slice_starts[app->selected_slice] / fsl->length;
+                    float ef = (float)fsl->slice_ends[app->selected_slice]   / fsl->length;
+                    if (sx >= 320 && sx <= 700) {
+                        float t = clampf((float)(sx - 320) / 380.0f, 0, 1);
+                        pthread_mutex_lock(&app->lock);
+                        sampler_set_slice(&app->sampler,
+                                          app->sampler.focused_slot,
+                                          app->selected_slice, t, ef);
+                        pthread_mutex_unlock(&app->lock);
+                    } else if (sx >= 1000 && sx <= 1380) {
+                        float t = clampf((float)(sx - 1000) / 380.0f, 0, 1);
+                        pthread_mutex_lock(&app->lock);
+                        sampler_set_slice(&app->sampler,
+                                          app->sampler.focused_slot,
+                                          app->selected_slice, sf, t);
+                        pthread_mutex_unlock(&app->lock);
+                    }
+                }
+            }
         }
         if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
             if (ev.value == 1 && !app->touch_down) {
@@ -633,6 +713,71 @@ static void *touch_thread(void *arg) {
                 if (!debounced && sx >= 1500 && sx <= 1800 && sy >= 170 && sy <= 220) {
                     app->reverb_on = !app->reverb_on;
                     if (!app->reverb_on) reverb_clear(&app->reverb);
+                }
+
+                /* SAMPLER tab touch */
+                if (app->engine_idx == ENG_SAMPLER) {
+                    SampleSlot *fsl = &app->sampler.slots[app->sampler.focused_slot];
+                    /* Pad grid tap → focus slot */
+                    if (!debounced && sx >= 80 && sx < 520 && sy >= 170 && sy < 510) {
+                        int c = (sx - 80) / 110;
+                        int r = (sy - 170) / 90;
+                        if (c >= 0 && c < 4 && r >= 0 && r < 4) {
+                            int idx = r * 4 + c;
+                            app->sampler.focused_slot = idx;
+                            app->selected_slice = 0;
+                        }
+                    }
+                    /* Slice strip tap → select slice under finger */
+                    if (sx >= 80 && sx <= 1440 && sy >= 605 && sy <= 675 &&
+                        fsl->slice_count > 0 && fsl->length > 0) {
+                        float frac = (float)(sx - 80) / 1360.0f;
+                        int sample_pos = (int)(frac * fsl->length);
+                        for (int i = 0; i < fsl->slice_count; i++) {
+                            if (sample_pos >= fsl->slice_starts[i] &&
+                                sample_pos < fsl->slice_ends[i]) {
+                                app->selected_slice = i;
+                                break;
+                            }
+                        }
+                    }
+                    /* Slice nav buttons */
+                    if (!debounced && sy >= 565 && sy <= 595) {
+                        if (sx >= 700 && sx <= 820 && fsl->slice_count > 0) {
+                            app->selected_slice =
+                                (app->selected_slice - 1 + fsl->slice_count) % fsl->slice_count;
+                        } else if (sx >= 830 && sx <= 950 && fsl->slice_count > 0) {
+                            app->selected_slice =
+                                (app->selected_slice + 1) % fsl->slice_count;
+                        } else if (sx >= 960 && sx <= 1100) {
+                            pthread_mutex_lock(&app->lock);
+                            sampler_reset_slices(&app->sampler,
+                                                 app->sampler.focused_slot);
+                            pthread_mutex_unlock(&app->lock);
+                            app->selected_slice = 0;
+                        }
+                    }
+                    /* Slice start/end slider tap */
+                    if (fsl->loaded && fsl->slice_count > 0 &&
+                        sy >= 700 && sy <= 730) {
+                        float sf = (float)fsl->slice_starts[app->selected_slice] / fsl->length;
+                        float ef = (float)fsl->slice_ends[app->selected_slice]   / fsl->length;
+                        if (sx >= 320 && sx <= 700) {
+                            float t = clampf((float)(sx - 320) / 380.0f, 0, 1);
+                            pthread_mutex_lock(&app->lock);
+                            sampler_set_slice(&app->sampler,
+                                              app->sampler.focused_slot,
+                                              app->selected_slice, t, ef);
+                            pthread_mutex_unlock(&app->lock);
+                        } else if (sx >= 1000 && sx <= 1380) {
+                            float t = clampf((float)(sx - 1000) / 380.0f, 0, 1);
+                            pthread_mutex_lock(&app->lock);
+                            sampler_set_slice(&app->sampler,
+                                              app->sampler.focused_slot,
+                                              app->selected_slice, sf, t);
+                            pthread_mutex_unlock(&app->lock);
+                        }
+                    }
                 }
 
                 /* CHORD tab touch */

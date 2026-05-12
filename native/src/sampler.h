@@ -41,6 +41,7 @@ typedef struct {
     int slice_starts[32];
     int slice_ends[32];
     int slice_count;
+    int slice_manual;  /* 1 once user has nudged any slice — preserves edits across triggers */
 
     int freeze_armed;
     float sample_bpm;
@@ -84,3 +85,12 @@ void sampler_trigger(SamplerEngine *s, int note, float vel);
 void sampler_release(SamplerEngine *s, int note);
 void sampler_process(SamplerEngine *s, float *buf, int n);
 int sampler_active(SamplerEngine *s);
+
+/* Slice editing — start/end as 0..1 fractions of sample length.
+   sampler_ensure_slices: materialize slices from SLICES param if not yet done.
+   sampler_set_slice: nudge one slice's start/end; sets slice_manual so subsequent
+     triggers don't auto-respread. End is clamped to [start+1, length].
+   sampler_reset_slices: clear manual edits and re-spread evenly. */
+void sampler_ensure_slices(SamplerEngine *s, int slot_idx);
+void sampler_set_slice(SamplerEngine *s, int slot_idx, int slice_idx, float start_frac, float end_frac);
+void sampler_reset_slices(SamplerEngine *s, int slot_idx);
