@@ -102,7 +102,7 @@ class SampleSlot:
     __slots__ = (
         "name", "path", "data", "source_rate", "_params", "loaded",
         "_pitch_cache", "_match_cache", "_slice_count_cache",
-        "_slice_points", "freeze_armed",
+        "_slice_points", "slice_manual", "freeze_armed",
         "sample_bpm", "bpm_confidence", "user_corrected", "match_mode",
     )
 
@@ -119,6 +119,9 @@ class SampleSlot:
         self._match_cache: dict[tuple[int, int], AudioBuffer] = {}
         self._slice_count_cache: int = 0
         self._slice_points: list[tuple[int, int]] = []
+        # Set True once the user has nudged any slice boundary — prevents
+        # refresh_slices() from clobbering manual edits until SLICES param changes.
+        self.slice_manual: bool = False
         # Granular Freeze armed (per-slot flag, not a parameter)
         self.freeze_armed: bool = False
         # BPM metadata (populated by loader.load_sample_with_meta)
@@ -157,6 +160,7 @@ class SampleSlot:
         self._match_cache.clear()
         self._slice_count_cache = 0
         self._slice_points = []
+        self.slice_manual = False
         self.sample_bpm = float(sample_bpm)
         self.bpm_confidence = float(bpm_confidence)
         self.user_corrected = bool(user_corrected)
@@ -170,6 +174,7 @@ class SampleSlot:
         self._pitch_cache.clear()
         self._match_cache.clear()
         self._slice_points = []
+        self.slice_manual = False
         self.sample_bpm = 0.0
         self.bpm_confidence = 0.0
         self.user_corrected = False
@@ -222,9 +227,15 @@ class SampleSlot:
         self._match_cache.clear()
 
     def refresh_slices(self) -> None:
-        """Recompute slice boundaries when SLICES param changes."""
+        """Recompute slice boundaries when SLICES param changes.
+
+        Manual edits are preserved as long as the SLICES count stays the same;
+        changing the count param wins and re-spreads evenly.
+        """
         n = self.slices
-        if n == self._slice_count_cache or not self.loaded:
+        if not self.loaded:
+            return
+        if n == self._slice_count_cache:
             return
         length = self.length
         slice_w = length // max(1, n)
@@ -233,6 +244,37 @@ class SampleSlot:
             for i in range(n)
         ]
         self._slice_count_cache = n
+        self.slice_manual = False
+
+    def nudge_slice_boundary(self, boundary_idx: int, frac: float) -> None:
+        """Move the boundary between slice (boundary_idx - 1) and slice
+        boundary_idx to `frac` (0..1 of sample length). Adjusts both adjacent
+        slices to stay contiguous. boundary_idx=0 (sample start) and
+        boundary_idx=N (sample end) are not movable.
+        """
+        if not self.loaded or self.length <= 0:
+            return
+        n = len(self._slice_points)
+        if boundary_idx <= 0 or boundary_idx >= n:
+            return
+        length = self.length
+        frac = max(0.0, min(1.0, frac))
+        pos = int(frac * length)
+        prev_start, _ = self._slice_points[boundary_idx - 1]
+        _, this_end = self._slice_points[boundary_idx]
+        # Keep each side at least 1 sample wide
+        pos = max(prev_start + 1, min(this_end - 1, pos))
+        pts = list(self._slice_points)
+        pts[boundary_idx - 1] = (prev_start, pos)
+        pts[boundary_idx] = (pos, this_end)
+        self._slice_points = pts
+        self.slice_manual = True
+
+    def reset_slices(self) -> None:
+        """Drop manual slice edits and re-spread evenly from the SLICES param."""
+        self._slice_count_cache = 0
+        self.slice_manual = False
+        self.refresh_slices()
 
 
 class SamplerVoice:

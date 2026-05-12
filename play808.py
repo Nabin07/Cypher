@@ -1471,7 +1471,7 @@ def _draw_sampler_panel(screen, fonts, player, mouse_pos, hit, y):
             y += 32
 
     # Waveform view of focused slot (full width)
-    _draw_sampler_waveform(screen, fonts, sampler, 20, y, WIN_W - 40, 130)
+    _draw_sampler_waveform(screen, fonts, sampler, 20, y, WIN_W - 40, 130, hit=hit)
     y += 138
 
     # Key hint
@@ -1483,8 +1483,13 @@ def _draw_sampler_panel(screen, fonts, player, mouse_pos, hit, y):
     return y
 
 
-def _draw_sampler_waveform(screen, fonts, sampler, x, y, w, h):
-    """Waveform view of focused slot with START/END handles + slice markers."""
+def _draw_sampler_waveform(screen, fonts, sampler, x, y, w, h, hit=None):
+    """Waveform view of focused slot with START/END handles + slice markers.
+
+    When `hit` is provided, registers draggable hit rects for slice boundaries
+    (`sampler_chop_<N>`) and a `sampler_chop_reset` button so the event loop
+    can wire interactive slice nudging.
+    """
     import numpy as np
     font = fonts[0]
     pygame.draw.rect(screen, (12, 12, 22), (x, y, w, h), border_radius=6)
@@ -1545,13 +1550,29 @@ def _draw_sampler_waveform(screen, fonts, sampler, x, y, w, h):
     if slot.mode == MODE_CHOP:
         slot.refresh_slices()
         n_slices = len(slot._slice_points)
+        line_col = CYAN if slot.slice_manual else MAGENTA
         for si, (s_start, _) in enumerate(slot._slice_points):
             frac = s_start / max(1, slot.length)
             sx = base_x + int(frac * (display_w - 1))
             if si > 0:
-                pygame.draw.line(screen, MAGENTA, (sx, y + 4), (sx, y + h - 4), 1)
+                pygame.draw.line(screen, line_col, (sx, y + 4), (sx, y + h - 4), 2)
+                if hit is not None:
+                    hit[f"sampler_chop_{si}"] = pygame.Rect(sx - 5, y + 4, 11, h - 8)
             if n_slices <= 16 and display_w // max(1, n_slices) > 20:
-                screen.blit(font.render(str(si + 1), True, MAGENTA), (sx + 2, y + 4))
+                screen.blit(font.render(str(si + 1), True, line_col), (sx + 2, y + 4))
+        # Register strip geometry so the motion handler can map mouse x → frac
+        if hit is not None:
+            hit["sampler_chop_strip"] = pygame.Rect(base_x, y, display_w, h)
+            if slot.slice_manual:
+                btn_w, btn_h = 64, 18
+                btn_rect = pygame.Rect(x + w - btn_w - 6, y + h - btn_h - 4,
+                                       btn_w, btn_h)
+                pygame.draw.rect(screen, (40, 80, 40), btn_rect, border_radius=3)
+                pygame.draw.rect(screen, GREEN, btn_rect, 1, border_radius=3)
+                lbl = font.render("RESET", True, GREEN)
+                screen.blit(lbl, (btn_rect.x + (btn_w - lbl.get_width()) // 2,
+                                  btn_rect.y + (btn_h - lbl.get_height()) // 2))
+                hit["sampler_chop_reset"] = btn_rect
 
     # Live playhead for any voice playing this slot
     for v in sampler._voices:
@@ -2390,6 +2411,7 @@ def main():
                             P_FZ_POS as _PFP, P_FZ_GRAIN as _PFG,
                             P_FZ_MOTION as _PFM, P_FZ_RATE as _PFR,
                             DIVISION_VALUES as _DIV_VALS,
+                            MODE_CHOP as _MC,
                         )
                         # PITCH +/- buttons (1 semitone each)
                         r = hit.get("sampler_pitch_minus")
@@ -2438,6 +2460,26 @@ def main():
                                 slot_f.params[_PSL].value = (target - 1) / 31.0
                                 slot_f.refresh_slices()
                                 break
+
+                        # CHOP slice boundary drag — pick up the boundary under
+                        # the cursor and start a drag session.
+                        if slot_f.mode == _MC:
+                            r = hit.get("sampler_chop_reset")
+                            if r and r.collidepoint(mx, my):
+                                with player.lock:
+                                    slot_f.reset_slices()
+                            else:
+                                for si in range(1, len(slot_f._slice_points)):
+                                    r = hit.get(f"sampler_chop_{si}")
+                                    if r and r.collidepoint(mx, my):
+                                        dragging_slider = f"sampler_chop_{si}"
+                                        strip = hit.get("sampler_chop_strip")
+                                        if strip is not None:
+                                            frac = max(0.0, min(1.0,
+                                                (mx - strip.x) / max(1, strip.width - 1)))
+                                            with player.lock:
+                                                slot_f.nudge_slice_boundary(si, frac)
+                                        break
 
                     # Send toggle (per-engine)
                     _send_idx = tab_voice_idx(player.voice_idx)
@@ -2630,6 +2672,17 @@ def main():
                         if r:
                             t = max(0.0, min(1.0, (mx_pos - r.x) / r.width))
                             player.chord_swing = t
+                    elif dragging_slider.startswith("sampler_chop_") and \
+                         dragging_slider.split("_")[-1].isdigit():
+                        si = int(dragging_slider.split("_")[-1])
+                        strip = hit.get("sampler_chop_strip")
+                        slot_d = player.sampler.slots[
+                            player.sampler.focused_slot_idx]
+                        if strip is not None:
+                            frac = max(0.0, min(1.0,
+                                (mx_pos - strip.x) / max(1, strip.width - 1)))
+                            with player.lock:
+                                slot_d.nudge_slice_boundary(si, frac)
                     elif dragging_slider in (
                         "sampler_pitch_slider", "sampler_gain_slider",
                         "sampler_slices_slider", "sampler_fz_pos_slider",
